@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 def _now():
     """Injectable clock — the soak test drives simulated months through it."""
@@ -247,15 +247,17 @@ def content_size(entries, fmt):
 class Entry:
     __slots__ = ("text", "toks", "pos", "is_header")
 
-    def __init__(self, text, pos):
+    def __init__(self, text, pos, is_header=False):
         self.text = text
         self.toks = tokens(text)
         self.pos = pos          # original position: later = newer (append-log)
-        # a markdown section header is structure, not a memory: it is never a
-        # dedup/supersession candidate and is re-emitted verbatim in place
-        # (auditor finding: bullets parser glued mid-file headers into the
-        # previous bullet, so a header could be archived as dedup side-cargo)
-        self.is_header = text.lstrip().startswith("#")
+        # a markdown section header is structure, not a memory: never a
+        # dedup/supersession candidate, re-emitted verbatim in place. This is
+        # ONLY meaningful in bullets mode — in sections/paragraphs a leading
+        # '#' is ordinary entry content, so is_header must be gated on the
+        # format by the caller (auditor finding: computing it globally
+        # wrongly exempted Hermes `sections` entries that start with '#').
+        self.is_header = is_header
 
     @property
     def eid(self):
@@ -287,7 +289,11 @@ def _short(t, n=100):
 
 class Dreamer:
     def __init__(self, entries, fmt, opts):
-        self.entries = [Entry(t, i) for i, t in enumerate(entries)]
+        # only bullets mode has structural headers; in sections/paragraphs a
+        # leading '#' is ordinary content
+        hdr = fmt == "bullets"
+        self.entries = [Entry(t, i, is_header=(hdr and t.lstrip().startswith("#")))
+                        for i, t in enumerate(entries)]
         self.fmt = fmt
         self.opts = opts
         self.actions = []
@@ -559,6 +565,8 @@ def _preflight_apply_paths(target):
     ]
     for p in candidates:
         if p.is_symlink():
+            return str(p)
+        if p.is_dir():                      # a directory where a file must go
             return str(p)
         if p.exists() and not os.access(str(p), os.W_OK):
             return str(p)

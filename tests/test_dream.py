@@ -432,6 +432,28 @@ class TestAuditFindings(TmpTest):
         self.assertEqual(p.read_text("utf-8"), before,
                          "target must be untouched when the archive can't be written")
 
+    def test_hash_entry_in_sections_is_normal_content(self):
+        # in sections mode a leading '#' is ordinary content, NOT a structural
+        # header — it must still supersede/dedup normally
+        a = "# server region is frankfurt primary with helsinki backup"
+        b = "# server region is frankfurt primary with helsinki failover"
+        d = mk([a, b])   # default fmt is sections
+        d.light_sleep()
+        d.deep_sleep()
+        self.assertEqual(len(d.entries), 1,
+                         "a '#'-leading sections entry must consolidate normally")
+
+    def test_preflight_rejects_directory_sidefile(self):
+        p = self.write("mem.md",
+                       "dup one two three four five" + SECTION_DELIM +
+                       "dup one two three four five" + SECTION_DELIM + "keep zeta")
+        (self.tmp / "DREAMS.md").mkdir()      # a directory where a file must go
+        before = p.read_text("utf-8")
+        code, _, err = self._cli(str(p), "--apply")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(p.read_text("utf-8"), before,
+                         "a directory side-file must abort apply, not half-complete")
+
     def _cli(self, *args):
         import io
         from contextlib import redirect_stdout, redirect_stderr

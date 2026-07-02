@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.1 — 2026-07-02
+
+Follow-up to 1.2.0 (two edge cases caught by a verification pass):
+
+- `is_header` is now gated on `bullets` format only. In `sections`
+  (Hermes) and `paragraphs`, a leading `#` is ordinary entry content and
+  must still dedup/supersede/age normally — 1.2.0 wrongly exempted it.
+- `--apply` preflight now also rejects a side-file path that is a
+  *directory* (e.g. a `mkdir`'d DREAMS.md), which previously slipped past
+  the writability check and half-completed. 48 tests.
+
 ## 1.2.0 — 2026-07-02
 
 Second adversarial audit (Opus-4.8 fleet, each finding reproduced-or-refuted).

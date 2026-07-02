@@ -1,7 +1,7 @@
 ---
 name: dream
 description: Sleep-cycle cleanup for agent memory files, budget-safe.
-version: 1.2.0
+version: 1.2.1
 author: Da7-Tech
 license: MIT
 platforms: [linux, macos, windows]
@@ -37,7 +37,7 @@ removed entry is archived with a written reason.
 
 - `python3` (3.9+) and `curl` on PATH — no API keys, no server, no
   packages. The tool is one stdlib-only file, MIT-licensed, from
-  https://github.com/Da7-Tech/dream (46 tests + a 90-day soak test run in
+  https://github.com/Da7-Tech/dream (48 tests + a 90-day soak test run in
   its CI on Linux/macOS/Windows).
 
 ## How to Run
@@ -47,8 +47,8 @@ integrity-checked:
 
 ```bash
 mkdir -p ~/.hermes/tools && cd ~/.hermes/tools
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.2.0/dream.py
-echo "1f94b3418fc05a71791793f13ab33837974ecfb2361ffe24906afeb115ef4704  dream.py" | shasum -a 256 -c
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.2.1/dream.py
+echo "039e581fcf326c47720344531f66df3967e7011162d8b2200ae653122ee702ff  dream.py" | shasum -a 256 -c
 ```
 
 ## Quick Reference
@@ -94,7 +94,7 @@ hermes cron create "0 4 * * *" --name memory-dream --script dream_nightly.sh --n
 ## Verification
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.2.0/dream.py && printf 'user name is raif\n§\nuser name is raif' > MEMORY.md && python3 dream.py MEMORY.md --apply --quiet && cat MEMORY.md
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.2.1/dream.py && printf 'user name is raif\n§\nuser name is raif' > MEMORY.md && python3 dream.py MEMORY.md --apply --quiet && cat MEMORY.md
 ```
 
 Expected: `MEMORY.md consolidated: 2 -> 1 entries, ...` and the file
