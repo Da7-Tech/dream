@@ -1,5 +1,11 @@
 # dream — a sleep cycle for your agent's existing memory
 
+[![tests](https://github.com/Da7-Tech/dream/actions/workflows/ci.yml/badge.svg)](https://github.com/Da7-Tech/dream/actions/workflows/ci.yml)
+[![deps](https://img.shields.io/badge/dependencies-0-brightgreen)](https://github.com/Da7-Tech/dream/blob/main/dream.py)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![English](https://img.shields.io/badge/README-English-2ea44f)](README.md)
+[![العربية](https://img.shields.io/badge/README-%EF%BA%8D%EF%BB%9F%EF%BB%8C%EF%BA%AE%EF%BA%91%EF%BB%B4%EF%BA%94-8A2BE2)](README.ar.md)
+
 **One Python file. Zero dependencies. Zero LLM calls. 100% deterministic. Never deletes — only archives.**
 
 Your coding agent already has a memory file — Hermes' `MEMORY.md`, Claude
