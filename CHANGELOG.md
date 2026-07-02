@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0 — 2026-07-02
+
+- **90-day soak test** (`bench/soak.py`, now in CI): the real code driven
+  through an injectable clock (`_now`) over 90 simulated days of daily
+  churn + nightly `--apply --budget 2200`. Verified: the budget held on
+  all 90 nights, the newest statement of every evolving subject won,
+  nothing was ever lost (file ∪ archive conservation), the aged file is
+  idempotent, and two full reruns are byte-identical.
+- `_now()` injectable clock (refactor, no behavior change).
+
 ## 1.0.0 — 2026-07-02
 
 First public release.

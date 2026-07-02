@@ -5,7 +5,7 @@ description: >-
   dedup, supersession, contradiction flags, and hard char-budget squeeze for
   MEMORY.md/USER.md. Zero LLM calls, zero tokens, dry-run first, never
   deletes (archives with reasons). One Python file, zero dependencies.
-version: 1.0.0
+version: 1.1.0
 author: Da7-Tech
 license: MIT
 platforms: [linux, macos]
@@ -110,3 +110,6 @@ no model call happens.
   memory). For non-chronological files use `--no-supersede`.
 - Merging is deterministic clause algebra, not LLM rewriting — wording can
   be mechanical; information is preserved.
+- Long-run behavior is validated by a 90-day simulated soak in CI: the char
+  budget held on all 90 nights, newest statements won, and nothing was lost
+  (file ∪ archive conservation, byte-identical reruns).

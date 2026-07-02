@@ -39,7 +39,12 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
+
+def _now():
+    """Injectable clock — the soak test drives simulated months through it."""
+    return datetime.now()
+
 
 SECTION_DELIM = "\n§\n"          # Hermes memory_tool entry delimiter
 NEAR_DUP_JACCARD = 0.85
@@ -330,7 +335,7 @@ class Dreamer:
     def age_out(self, state, max_age_days):
         if not max_age_days:
             return
-        now = datetime.now()
+        now = _now()
         kept = []
         for e in self.entries:
             first_seen = state.get(e.eid, {}).get("first_seen")
@@ -499,7 +504,7 @@ def load_state(target):
 
 
 def save_state(target, entries, old_state):
-    now = datetime.now().isoformat(timespec="seconds")
+    now = _now().isoformat(timespec="seconds")
     st = {}
     for e in entries:
         prev = old_state.get(e.eid, {})
@@ -515,7 +520,7 @@ def save_state(target, entries, old_state):
 def append_archive(target, actions):
     arch = target.parent / ("%s.dream-archive.md" % target.name)
     lines = []
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    stamp = _now().strftime("%Y-%m-%d %H:%M")
     for a in actions:
         if a.removed:
             lines.append("## %s — %s (%s)\n\n%s\n" % (stamp, a.kind, a.reason, a.removed))
@@ -565,7 +570,7 @@ def dream_file(target, opts):
     size_after = content_size(new_entries, fmt)
 
     # build the journal report
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    stamp = _now().strftime("%Y-%m-%d %H:%M")
     rep = ["## dream — %s — %s" % (stamp, target.name), ""]
     rep.append("- entries: %d -> %d | chars: %d -> %d%s"
                % (len(entries), len(new_entries), size_before, size_after,
@@ -610,7 +615,7 @@ def dream_file(target, opts):
     # apply: backup -> write -> archive -> journal -> state
     if changed:
         backup = target.parent / ("%s.bak-dream-%s" % (
-            target.name, datetime.now().strftime("%Y%m%d-%H%M%S")))
+            target.name, _now().strftime("%Y%m%d-%H%M%S")))
         _atomic_write(backup, original)
         _atomic_write(target, new_text)
         arch = append_archive(target, d.actions)
