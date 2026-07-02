@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.2.0 — 2026-07-02
+
+Second adversarial audit (Opus-4.8 fleet, each finding reproduced-or-refuted).
+Confirmed defects fixed, each with a regression test (46 tests):
+
+- **`--apply` is now all-or-nothing.** It preflights the archive/journal/state
+  paths before overwriting the live memory; if any is a symlink or unwritable
+  it aborts cleanly (exit 1, clear message) instead of half-completing —
+  previously it overwrote the target, then died with a raw traceback and the
+  removed entries were never archived.
+- **Word-order-blind dedup fixed.** "A calls B" and "B calls A" (same token
+  bag, reversed order) were archived as "same fact worded twice". Near-dups
+  now require the shared tokens in the same order; order-reversed pairs fall
+  through to the conflict flag. The equal-length tie-break now keeps the
+  LATER (newer) entry, consistent with newest-wins supersession.
+- **Bullets parser no longer swallows headers.** A `## header` between bullet
+  groups was absorbed as a continuation line and could be deleted as dedup
+  side-cargo. Headers are now structural: never deduped, superseded, merged,
+  aged-out, or archived-for-budget, and re-emitted in place.
+- **`--format` as the last argument** no longer crashes with an IndexError —
+  same bounds guard as `--budget`/`--max-age`.
+- **Honest measurement:** the 90-day soak's budget assertion was vacuous (the
+  workload never exceeded the budget). A dedicated budget-stress leg now feeds
+  non-dedupable churn against a small budget so the squeeze path actually
+  fires and the hard limit is verified held. Docs corrected: char accounting
+  is character/codepoint-based (not "byte-for-byte").
+
 ## 1.1.1 — 2026-07-02
 
 Audit-hardening (findings from independent code audits, verified then fixed):

@@ -72,7 +72,7 @@ Auto-detected (or force with `--format`):
 
 | format | used by | entries are |
 |---|---|---|
-| `sections` | **Hermes** (`MEMORY.md`, `USER.md`) | blocks separated by `§` — size accounting matches Hermes' own char-limit math exactly |
+| `sections` | **Hermes** (`MEMORY.md`, `USER.md`) | blocks separated by `§` — size accounting matches Hermes' own char-limit math (Python `len()` codepoint count, character-for-character) |
 | `bullets` | Claude Code memory, most `AGENTS.md` notes | `- ` bullets (with continuation lines); headers preserved untouched |
 | `paragraphs` | plain notes files | blank-line separated blocks |
 
@@ -105,11 +105,14 @@ broken-plural handling), so mixed-language memories consolidate correctly.
 
 ## Measured
 
-- 40 unit tests, stdlib `unittest`: `python3 -m unittest discover -s tests`
+- 43 unit tests, stdlib `unittest`: `python3 -m unittest discover -s tests`
 - **90-day soak in CI** (`bench/soak.py` — real code, injected clock, daily
-  churn + nightly budgeted dream): budget held on all 90 nights, newest
-  statement of every evolving subject won, nothing lost (file ∪ archive),
-  byte-identical across full reruns
+  churn + nightly dream): newest statement of every evolving subject won,
+  nothing lost (file ∪ archive), byte-identical across full reruns. A
+  separate **budget-stress leg** feeds non-dedupable novel churn against a
+  small budget so the squeeze path actually fires (archive-for-budget) and
+  the hard char limit is verified held on every night — the budget
+  guarantee is also covered directly by unit tests.
 - Determinism and idempotence are tested, not promised
 - Consolidating a 13-entry real-world memory: **< 20 ms**, 0 tokens
 
@@ -127,6 +130,10 @@ cross-agent export — that's the sister project:
   newer). If yours isn't append-ordered, use `--no-supersede`.
 - Merging is clause-level text algebra: it preserves every novel clause but
   won't rewrite prose the way an LLM would — by design (determinism > polish).
+- Near-duplicate detection is bag-of-words with an order guard: two entries
+  are only merged when they share the same tokens *in the same order*, so
+  "A calls B" and "B calls A" are treated as distinct (they fall through to
+  the conflict flag), not silently deduped.
 - Theme detection is term-frequency based, a report not an oracle.
 - Pairwise comparison is O(n²): instant for agent-memory files (a 13-entry
   real memory: ~2 ms), slow for huge files (an adversarial 18,000-entry,

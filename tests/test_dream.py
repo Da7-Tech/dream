@@ -3,6 +3,7 @@
 Run:  python3 -m unittest discover -s tests -v
 """
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -365,6 +366,82 @@ class TestCLI(TmpTest):
         self.assertEqual(code, 0)
         self.assertIn("dry run", out)
         self.assertIn("exact-duplicate", out)
+
+
+class TestAuditFindings(TmpTest):
+    """Second adversarial audit (Opus fleet) — verified receipts."""
+
+    def test_word_order_reversed_not_deduped(self):
+        # "A calls B" vs "B calls A" are opposite facts, not duplicates
+        d = mk(["the gateway service calls the auth service on startup",
+                "the auth service calls the gateway service on startup"])
+        d.light_sleep()
+        self.assertEqual(len(d.entries), 2,
+                         "order-reversed facts must not be deduped")
+
+    def test_dedup_richer_wording_wins(self):
+        a = "raif prefers tabs over spaces for indent"
+        b = "raif prefers tabs over spaces for indent in every file"  # richer
+        d = mk([a, b])
+        d.light_sleep()
+        self.assertEqual(len(d.entries), 1)
+        self.assertEqual(d.entries[0].text, b, "the richer wording is kept")
+
+    def test_dedup_tiebreak_prefers_later_on_equal_length(self):
+        # high-overlap near-dup (13/14 tokens shared), equal length, one
+        # same-length word swapped — the later (newer) entry must win the tie
+        base = "alpha bravo charlie xray echo foxtrot golf hotel india juliet kilo lima mike"
+        x = base + " sierra"
+        y = base + " quebec"                     # distinct, same length, later
+        d = mk([x, y])
+        d.light_sleep()
+        self.assertEqual(len(d.entries), 1)
+        self.assertEqual(d.entries[0].pos, 1,
+                         "equal-length near-dup tie keeps the later (newer) entry")
+
+    def test_bullets_header_not_absorbed_or_deleted(self):
+        text = ("# Memory\n\n- api uses bearer tokens for auth\n"
+                "## database\n- db is postgres 16 primary\n"
+                "- db is postgres 16 primary\n")   # last is a dup
+        p = self.write("notes.md", text)
+        dream_file(p, {"apply": True, "quiet": True})
+        out = p.read_text("utf-8")
+        self.assertIn("## database", out, "mid-file header must survive")
+        self.assertIn("# Memory", out)
+        self.assertEqual(out.count("db is postgres 16 primary"), 1, "dup still removed")
+
+    def test_format_last_arg_no_crash(self):
+        p = self.write("m.md", "a" + SECTION_DELIM + "b")
+        code, _, err = self._cli(str(p), "--format")
+        self.assertEqual(code, 2)
+        self.assertIn("--format", err)
+
+    def test_apply_aborts_cleanly_if_archive_unwritable(self):
+        if os.name == "nt":
+            self.skipTest("symlinks need privileges on Windows")
+        p = self.write("mem.md",
+                       "keep alpha one two three four five six seven"
+                       + SECTION_DELIM +
+                       "keep alpha one two three four five six seven"
+                       + SECTION_DELIM + "unique zeta lonely fact")
+        # make the archive path an unwritable symlink
+        (self.tmp / "mem.md.dream-archive.md").symlink_to(self.tmp / "nowhere")
+        before = p.read_text("utf-8")
+        code, _, err = self._cli(str(p), "--apply")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(p.read_text("utf-8"), before,
+                         "target must be untouched when the archive can't be written")
+
+    def _cli(self, *args):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                code = D.main(list(args))
+        except SystemExit as e:
+            code = e.code
+        return code, out.getvalue(), err.getvalue()
 
 
 if __name__ == "__main__":

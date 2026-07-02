@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 def _now():
     """Injectable clock — the soak test drives simulated months through it."""
@@ -132,6 +132,17 @@ def containment(a, b):
     return len(sa & sb) / min(len(sa), len(sb))
 
 
+def _same_sequence(a, b):
+    """True if the two token lists carry the shared tokens in the SAME
+    relative order — the guard that distinguishes 'same fact reworded' from
+    'opposite fact, words reversed'. The longer list may add tokens (a
+    richer restatement) but must not REORDER the shared ones."""
+    common = set(a) & set(b)
+    sa = [t for t in a if t in common]
+    sb = [t for t in b if t in common]
+    return sa == sb
+
+
 def _atomic_write(path, data):
     """Atomic, durable, symlink-refusing write: fsync before rename so
     the new content survives power loss, not just process crashes."""
@@ -181,6 +192,15 @@ def parse(text, fmt):
                 if cur:
                     entries.append("\n".join(cur).strip())
                 cur = [ln]
+            elif ln.lstrip().startswith("#"):
+                # a section header is a structural boundary: flush the current
+                # bullet and keep the header as its own standalone entry so it
+                # is never absorbed as a continuation line and can't be
+                # archived as dedup side-cargo (auditor finding)
+                if cur:
+                    entries.append("\n".join(cur).strip())
+                    cur = []
+                entries.append(ln.strip())
             elif ln.strip() and cur:
                 cur.append(ln)          # continuation line
             elif not ln.strip():
@@ -225,12 +245,17 @@ def content_size(entries, fmt):
 # The consolidation pipeline
 # ────────────────────────────────────────────────────────────────
 class Entry:
-    __slots__ = ("text", "toks", "pos")
+    __slots__ = ("text", "toks", "pos", "is_header")
 
     def __init__(self, text, pos):
         self.text = text
         self.toks = tokens(text)
         self.pos = pos          # original position: later = newer (append-log)
+        # a markdown section header is structure, not a memory: it is never a
+        # dedup/supersession candidate and is re-emitted verbatim in place
+        # (auditor finding: bullets parser glued mid-file headers into the
+        # previous bullet, so a header could be archived as dedup side-cargo)
+        self.is_header = text.lstrip().startswith("#")
 
     @property
     def eid(self):
@@ -285,19 +310,38 @@ class Dreamer:
         self.entries = kept
         kept = []
         for e in self.entries:
+            if e.is_header:          # structure, never a dedup candidate
+                kept.append(e)
+                continue
             dup_of = None
             for k in kept:
+                if k.is_header:
+                    continue
                 if (jaccard(e.toks, k.toks) >= NEAR_DUP_JACCARD or
                         containment(e.toks, k.toks) >= NEAR_DUP_CONTAINMENT):
-                    dup_of = k
-                    break
+                    # Same token BAG isn't the same fact if the words are in a
+                    # different ORDER: "A calls B" vs "B calls A", "prefers
+                    # tabs over spaces" vs "prefers spaces over tabs" are
+                    # opposites, not duplicates. Require the near-identical
+                    # pair to share the same token SEQUENCE before merging;
+                    # order-reversed pairs fall through to the deep-sleep
+                    # conflict scan instead (auditor finding).
+                    if _same_sequence(e.toks, k.toks):
+                        dup_of = k
+                        break
             if dup_of is None:
                 kept.append(e)
             else:
-                # keep whichever says more; position of the survivor stays
-                rich, poor = (e, dup_of) if len(e.text) > len(dup_of.text) else (dup_of, e)
-                if rich is e:
+                # keep whichever says more; on a tie keep the LATER entry
+                # (the file is an append log, later = newer — consistent with
+                # supersession's newest-wins rule; the old tie-break kept the
+                # older entry and could revert a correction — auditor finding)
+                if len(e.text) > len(dup_of.text) or (
+                        len(e.text) == len(dup_of.text) and e.pos > dup_of.pos):
+                    rich, poor = e, dup_of
                     kept[kept.index(dup_of)] = e
+                else:
+                    rich, poor = dup_of, e
                 self.actions.append(Action(
                     "light", "near-duplicate",
                     "same fact worded twice (%.0f%% token overlap); kept the richer wording"
@@ -314,6 +358,8 @@ class Dreamer:
         for i in range(len(es)):
             for j in range(i + 1, len(es)):
                 a, b = es[i], es[j]
+                if a.is_header or b.is_header:   # never supersede structure
+                    continue
                 if a.eid in removed or b.eid in removed:
                     continue
                 sj = jaccard(a.subject(), b.subject())
@@ -342,6 +388,9 @@ class Dreamer:
         now = _now()
         kept = []
         for e in self.entries:
+            if e.is_header:          # structure never ages out
+                kept.append(e)
+                continue
             first_seen = state.get(e.eid, {}).get("first_seen")
             if first_seen:
                 try:
@@ -384,6 +433,8 @@ class Dreamer:
                 es = self.entries
                 for i in range(len(es)):
                     for j in range(i + 1, len(es)):
+                        if es[i].is_header or es[j].is_header:
+                            continue     # never merge a structural header
                         sim = jaccard(es[i].toks, es[j].toks)
                         # same leading subject (identical first 3 stemmed
                         # tokens) is merge-eligible even at lower overlap
@@ -410,10 +461,13 @@ class Dreamer:
                     self.entries = [x for k, x in enumerate(self.entries)
                                     if k not in (i, j)] + [e]
                     merged = True
-        # step 2: archive the most redundant entries until we fit
-        while content_size([e.text for e in self.entries], self.fmt) > budget \
-                and len(self.entries) > 1:
-            victim = min(self.entries, key=self._info_density)
+        # step 2: archive the most redundant entries until we fit (never a
+        # header — structure isn't budget ballast)
+        while content_size([e.text for e in self.entries], self.fmt) > budget:
+            candidates = [e for e in self.entries if not e.is_header]
+            if len(candidates) <= 1:
+                break
+            victim = min(candidates, key=self._info_density)
             self.entries.remove(victim)
             self.actions.append(Action(
                 "squeeze", "archived-for-budget",
@@ -493,6 +547,27 @@ def _merge_texts(base, other):
 # ────────────────────────────────────────────────────────────────
 # State, archive, journal
 # ────────────────────────────────────────────────────────────────
+def _preflight_apply_paths(target):
+    """Return the first side-file path that could NOT be written safely
+    (symlink, or its parent isn't a writable directory), or None if all are
+    clear. Checked before the target is overwritten so apply is all-or-nothing."""
+    candidates = [
+        target.parent / ("%s.dream-archive.md" % target.name),
+        target.parent / "DREAMS.md",
+        state_path(target),
+        target.parent / ("%s.bak-dream-preflight" % target.name),
+    ]
+    for p in candidates:
+        if p.is_symlink():
+            return str(p)
+        if p.exists() and not os.access(str(p), os.W_OK):
+            return str(p)
+    # the directory itself must be writable (for the tmp + rename dance)
+    if not os.access(str(target.parent), os.W_OK):
+        return str(target.parent)
+    return None
+
+
 def state_path(target):
     return target.parent / (".%s.dream-state.json" % target.name)
 
@@ -618,6 +693,17 @@ def dream_file(target, opts):
 
     # apply: backup -> write -> archive -> journal -> state
     if changed:
+        # Preflight the side-files BEFORE overwriting the live memory: if the
+        # archive/journal/state can't be written (symlink, unwritable dir,
+        # a directory in the way), abort now so we never leave the target
+        # consolidated with its removed entries un-archived (auditor finding:
+        # this used to half-complete and die with a raw traceback).
+        blocked = _preflight_apply_paths(target)
+        if blocked:
+            print("error: cannot safely apply — %s is not writable "
+                  "(symlink or bad path?). Nothing changed." % blocked,
+                  file=sys.stderr)
+            return 1
         backup = target.parent / ("%s.bak-dream-%s" % (
             target.name, _now().strftime("%Y%m%d-%H%M%S")))
         _atomic_write(backup, original)
@@ -708,6 +794,10 @@ def main(argv=None):
             opts[key] = val
         elif a == "--format":
             i += 1
+            if i >= len(argv):
+                print("error: --format needs a value "
+                      "(auto|sections|bullets|paragraphs)", file=sys.stderr)
+                return 2
             if argv[i] not in ("auto", "sections", "bullets", "paragraphs"):
                 print("error: unknown format %r" % argv[i], file=sys.stderr)
                 return 2
