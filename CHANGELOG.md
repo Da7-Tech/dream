@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.1 — 2026-07-02
+
+Audit-hardening (findings from independent code audits, verified then fixed):
+
+- fsync before rename in atomic writes — power-loss durability was
+  previously implied but not guaranteed; O_NOFOLLOW made portable.
+- Source guard test: `_now()` is enforced as the only time source.
+- CI: actions pinned by commit SHA, least-privilege permissions,
+  Windows added to the test matrix (40 tests).
+
 ## 1.1.0 — 2026-07-02
 
 - **90-day soak test** (`bench/soak.py`, now in CI): the real code driven

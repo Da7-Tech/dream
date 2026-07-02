@@ -105,7 +105,7 @@ broken-plural handling), so mixed-language memories consolidate correctly.
 
 ## Measured
 
-- 39 unit tests, stdlib `unittest`: `python3 -m unittest discover -s tests`
+- 40 unit tests, stdlib `unittest`: `python3 -m unittest discover -s tests`
 - **90-day soak in CI** (`bench/soak.py` — real code, injected clock, daily
   churn + nightly budgeted dream): budget held on all 90 nights, newest
   statement of every evolving subject won, nothing lost (file ∪ archive),

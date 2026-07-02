@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 def _now():
     """Injectable clock — the soak test drives simulated months through it."""
@@ -133,13 +133,17 @@ def containment(a, b):
 
 
 def _atomic_write(path, data):
+    """Atomic, durable, symlink-refusing write: fsync before rename so
+    the new content survives power loss, not just process crashes."""
     path = Path(path)
     if path.is_symlink():
         raise ValueError("refusing to write through a symlink: %s" % path)
     tmp = str(path) + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_TRUNC, 0o644)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | nofollow | os.O_TRUNC, 0o644)
     try:
         os.write(fd, data.encode("utf-8"))
+        os.fsync(fd)
     finally:
         os.close(fd)
     os.replace(tmp, str(path))

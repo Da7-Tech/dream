@@ -288,6 +288,13 @@ class TestDreamFile(TmpTest):
         rc = dream_file(p, {})
         self.assertEqual(rc, 0)
 
+    def test_no_direct_datetime_now_in_source(self):
+        """The injectable clock is the only time source — a stray
+        datetime.now() would silently break the soak test."""
+        src = (Path(__file__).resolve().parent.parent / "dream.py").read_text("utf-8")
+        self.assertEqual(src.count("datetime.now()"), 1,
+                         "only _now() may call datetime.now()")
+
     def test_arabic_memory(self):
         text = ("المستخدم يفضل الوضع الداكن دائمًا"
                 + SECTION_DELIM +
