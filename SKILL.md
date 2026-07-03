@@ -2,7 +2,7 @@
 name: dream
 description: Sleep-cycle cleanup for agent memory files, budget-safe.
 version: 1.2.1
-author: Da7-Tech
+author: Da7 (Da7-Tech)
 license: MIT
 platforms: [linux, macos, windows]
 prerequisites:
@@ -48,7 +48,7 @@ integrity-checked:
 ```bash
 mkdir -p ~/.hermes/tools && cd ~/.hermes/tools
 curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.2.1/dream.py
-echo "039e581fcf326c47720344531f66df3967e7011162d8b2200ae653122ee702ff  dream.py" | shasum -a 256 -c
+python3 -c "import hashlib;h=hashlib.sha256(open('dream.py','rb').read()).hexdigest();assert h=='039e581fcf326c47720344531f66df3967e7011162d8b2200ae653122ee702ff',h;print('dream.py: OK')"
 ```
 
 ## Quick Reference
@@ -94,7 +94,7 @@ hermes cron create "0 4 * * *" --name memory-dream --script dream_nightly.sh --n
 ## Verification
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.2.1/dream.py && printf 'user name is raif\n§\nuser name is raif' > MEMORY.md && python3 dream.py MEMORY.md --apply --quiet && cat MEMORY.md
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.2.1/dream.py && python3 -c "import hashlib;h=hashlib.sha256(open('dream.py','rb').read()).hexdigest();assert h=='039e581fcf326c47720344531f66df3967e7011162d8b2200ae653122ee702ff',h;print('OK')" && printf 'user name is khalid\n§\nuser name is khalid' > MEMORY.md && python3 dream.py MEMORY.md --apply --quiet && cat MEMORY.md
 ```
 
 Expected: `MEMORY.md consolidated: 2 -> 1 entries, ...` and the file

@@ -67,7 +67,7 @@ def run_once(seed):
     clock = [START]
     D._now = lambda: clock[0]
 
-    entries = ["user name is raif, a developer from riyadh"]
+    entries = ["user name is khalid, a developer from riyadh"]
     added_log = [entries[0]]
     evolve_idx = {k: 0 for k, _ in EVOLVING}
     target.write_text(entries[0], encoding="utf-8")
@@ -87,7 +87,7 @@ def run_once(seed):
                 new.append(versions[evolve_idx[key]])
         # dedup bait: core fact re-stated verbatim weekly
         if day % 7 == 0:
-            new.append("user name is raif, a developer from riyadh")
+            new.append("user name is khalid, a developer from riyadh")
         added_log.extend(new)
         target.write_text(current + D.SECTION_DELIM + D.SECTION_DELIM.join(new),
                           encoding="utf-8")

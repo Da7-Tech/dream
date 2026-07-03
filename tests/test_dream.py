@@ -380,8 +380,8 @@ class TestAuditFindings(TmpTest):
                          "order-reversed facts must not be deduped")
 
     def test_dedup_richer_wording_wins(self):
-        a = "raif prefers tabs over spaces for indent"
-        b = "raif prefers tabs over spaces for indent in every file"  # richer
+        a = "khalid prefers tabs over spaces for indent"
+        b = "khalid prefers tabs over spaces for indent in every file"  # richer
         d = mk([a, b])
         d.light_sleep()
         self.assertEqual(len(d.entries), 1)
