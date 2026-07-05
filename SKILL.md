@@ -1,7 +1,7 @@
 ---
 name: dream
 description: Sleep-cycle cleanup for agent memory files, budget-safe.
-version: 1.2.1
+version: 1.3.0
 author: Da7 (Da7-Tech)
 license: MIT
 platforms: [linux, macos, windows]
@@ -37,7 +37,7 @@ removed entry is archived with a written reason.
 
 - `python3` (3.9+) and `curl` on PATH — no API keys, no server, no
   packages. The tool is one stdlib-only file, MIT-licensed, from
-  https://github.com/Da7-Tech/dream (48 tests + a 90-day soak test run in
+  https://github.com/Da7-Tech/dream (53 tests + a 90-day soak test run in
   its CI on Linux/macOS/Windows).
 
 ## How to Run
@@ -47,8 +47,8 @@ integrity-checked:
 
 ```bash
 mkdir -p ~/.hermes/tools && cd ~/.hermes/tools
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.2.1/dream.py
-python3 -c "import hashlib;h=hashlib.sha256(open('dream.py','rb').read()).hexdigest();assert h=='039e581fcf326c47720344531f66df3967e7011162d8b2200ae653122ee702ff',h;print('dream.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.3.0/dream.py
+python3 -c "import hashlib;h=hashlib.sha256(open('dream.py','rb').read()).hexdigest();assert h=='d33bdfaeb182521a0c3710263d3f096523cc7ac1750a581e1bcc826cd2a3b5c0',h;print('dream.py: OK')"
 ```
 
 ## Quick Reference
@@ -94,7 +94,7 @@ hermes cron create "0 4 * * *" --name memory-dream --script dream_nightly.sh --n
 ## Verification
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.2.1/dream.py && python3 -c "import hashlib;h=hashlib.sha256(open('dream.py','rb').read()).hexdigest();assert h=='039e581fcf326c47720344531f66df3967e7011162d8b2200ae653122ee702ff',h;print('OK')" && printf 'user name is khalid\n§\nuser name is khalid' > MEMORY.md && python3 dream.py MEMORY.md --apply --quiet && cat MEMORY.md
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.3.0/dream.py && python3 -c "import hashlib;h=hashlib.sha256(open('dream.py','rb').read()).hexdigest();assert h=='d33bdfaeb182521a0c3710263d3f096523cc7ac1750a581e1bcc826cd2a3b5c0',h;print('OK')" && printf 'user name is khalid\n§\nuser name is khalid' > MEMORY.md && python3 dream.py MEMORY.md --apply --quiet && cat MEMORY.md
 ```
 
 Expected: `MEMORY.md consolidated: 2 -> 1 entries, ...` and the file

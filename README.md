@@ -76,8 +76,11 @@ Auto-detected (or force with `--format`):
 | `bullets` | Claude Code memory, most `AGENTS.md` notes | `- ` bullets (with continuation lines); headers preserved untouched |
 | `paragraphs` | plain notes files | blank-line separated blocks |
 
-Bilingual: tokenization and stemming handle English **and Arabic** (with
-broken-plural handling), so mixed-language memories consolidate correctly.
+Multilingual: the tokenizer/stemmer is shared with [`mind`](https://github.com/Da7-Tech/mind).
+English **and Arabic** (broken plurals unified onto one stem, so a singular
+and its plural count as the same fact), plus **CJK / kana / Hangul / Thai**
+indexed as character bigrams so space-less scripts consolidate too — mixed-
+language memories are handled correctly.
 
 ## Safety model (the whole point)
 
@@ -105,7 +108,7 @@ broken-plural handling), so mixed-language memories consolidate correctly.
 
 ## Measured
 
-- 43 unit tests, stdlib `unittest`: `python3 -m unittest discover -s tests`
+- 53 unit tests, stdlib `unittest`: `python3 -m unittest discover -s tests`
 - **90-day soak in CI** (`bench/soak.py` — real code, injected clock, daily
   churn + nightly dream): newest statement of every evolving subject won,
   nothing lost (file ∪ archive), byte-identical across full reruns. A

@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 def _now():
     """Injectable clock — the soak test drives simulated months through it."""
@@ -59,15 +59,36 @@ JOURNAL_MAX_BYTES = 64 * 1024
 
 
 # ────────────────────────────────────────────────────────────────
-# Bilingual (EN + AR) tokenization — same stemmer family as `mind`
+# Bilingual (EN + AR) + script-aware tokenization — kept in LOCK-STEP with
+# `mind`'s tokenizer/stemmer family (mind.py), so a memory file consolidated
+# by either tool tokenizes identically. Space-separated scripts (Latin,
+# Cyrillic, Arabic, Greek, ...) keep whole words >= 3 chars; CJK / kana /
+# Hangul / Thai runs — which don't separate meaning units with spaces — are
+# indexed as character BIGRAMS instead (the standard search-engine
+# technique). Without bigrams a Chinese/Japanese entry collapsed to one
+# opaque token that only matched an IDENTICAL whole run, so dedup and
+# supersession never fired on CJK memories (ported from mind 5.6.0).
 # ────────────────────────────────────────────────────────────────
-_TOKEN = re.compile(r"[\w؀-ۿ]{3,}", re.UNICODE)
+_WORD_RUN = re.compile(r"[\w؀-ۿ]+", re.UNICODE)
+# explicit \u escapes (not literal glyphs): the compatibility-ideograph
+# start U+F900 NFC-normalizes to U+8C48, so a literal here silently widens
+# the range over the Private Use Area — escapes are corruption-proof.
+_NOSPACE_RE = re.compile(
+    "[\u2E80-\u9FFF"    # CJK radicals + unified ideographs
+    "\u3400-\u4DBF"     # CJK extension A
+    "\uF900-\uFAFF"     # CJK compatibility ideographs
+    "\u3040-\u30FF"     # hiragana + katakana
+    "\uAC00-\uD7AF"     # hangul syllables
+    "\u0E00-\u0E7F]")   # thai
 
 STOPWORDS = frozenset({
     "the", "and", "for", "that", "with", "from", "this", "these", "those",
     "have", "has", "are", "was", "were", "not", "but", "you", "all", "can",
     "her", "him", "his", "she", "they", "them", "our", "out", "use", "using",
     "used", "what", "when", "where", "which", "who", "why", "how",
+    # function words shared with mind's stopword set (6.1.0)
+    "is", "be", "been", "being", "does", "did", "will", "its", "it",
+    "my", "your", "their",
     "من", "على", "في", "الى", "إلى", "التي", "التى", "الذي", "الذى", "هذا",
     "هذه", "عند", "قد", "ماذا", "اي", "أي", "لماذا", "كيف", "ما", "عن", "مع",
     "او", "أو", "ثم", "لكن", "بعد", "قبل", "كل", "بعض", "نحن", "انت", "أنت",
@@ -78,15 +99,73 @@ STOPWORDS = frozenset({
 _AR_SUFFIXES = ("تها", "تهن", "تنا", "تهم", "ية", "ون", "ين", "ان",
                 "ات", "ها", "هن", "هم", "نا", "ة", "ي", "ت", "ن")
 _AR_PREFIXES = ("وال", "بال", "كال", "فال", "لل", "ال", "و", "ف", "ب", "ل", "ك", "س")
+# Arabic broken plurals can't be reached by suffix stripping; a small seed
+# dictionary unifies singular + broken plural onto ONE canonical stem, so the
+# two spellings of the same subject count as the same fact for dedup and
+# supersession (ported from mind: without it "قاعدة" and "قواعد" tokenized
+# differently and a restated fact was never recognized as a duplicate).
+_BROKEN_PLURALS = {
+    "قاعدة": "قاعد", "مدينة": "مدين", "دولة": "دول", "أداة": "أدا",
+    "مشروع": "مشروع", "ملف": "ملف", "وكيل": "وكيل", "خبير": "خبير",
+    "قرار": "قرار", "رابط": "رابط", "بيان": "بيان", "حرف": "حرف",
+    "كلمة": "كلم", "عقدة": "عقد", "نموذج": "نموذج",
+    "قواعد": "قاعد", "مدن": "مدين", "دول": "دول", "أدوات": "أدا",
+    "مشاريع": "مشروع", "ملفات": "ملف", "وكلاء": "وكيل", "خبراء": "خبير",
+    "قرارات": "قرار", "روابط": "رابط", "بيانات": "بيان", "حروف": "حرف",
+    "كلمات": "كلم", "عقد": "عقد", "نماذج": "نموذج",
+    "وظيفة": "وظيف", "وظائف": "وظيف", "رسالة": "رسال", "رسائل": "رسال",
+    "جدول": "جدول", "جداول": "جدول",
+}
+
+
+def _bigrams(chars):
+    if len(chars) < 2:
+        return ["".join(chars)]
+    return ["".join(chars[i:i + 2]) for i in range(len(chars) - 1)]
+
+
+def _tokenize(text):
+    """Script-aware tokenizer: whole words for spaced scripts, character
+    bigrams for CJK/kana/Hangul/Thai runs. Shared verbatim with mind."""
+    out = []
+    for run in _WORD_RUN.findall(text or ""):
+        alpha, nospace = [], []
+        for ch in run:
+            if _NOSPACE_RE.match(ch):
+                if alpha:
+                    if len(alpha) >= 3:
+                        out.append("".join(alpha))
+                    alpha = []
+                nospace.append(ch)
+            else:
+                if nospace:
+                    out.extend(_bigrams(nospace))
+                    nospace = []
+                alpha.append(ch)
+        if len(alpha) >= 3:
+            out.append("".join(alpha))
+        if nospace:
+            out.extend(_bigrams(nospace))
+    return out
 
 
 def stem(w):
     if w and "؀" <= w[0] <= "ۿ":
+        # full-word broken-plural lookup FIRST: stripping a "prefix" that is
+        # actually the first ROOT letter (كلمة -> لمة) otherwise bypasses the
+        # dictionary entirely (ported from mind's auditor finding)
+        if w in _BROKEN_PLURALS:
+            return _BROKEN_PLURALS[w]
         s = w
         for p in _AR_PREFIXES:
             if s.startswith(p) and len(s) - len(p) >= 3:
-                s = s[len(p):]
+                stripped = s[len(p):]
+                if stripped in _BROKEN_PLURALS:
+                    return _BROKEN_PLURALS[stripped]
+                s = stripped
                 break
+        if s in _BROKEN_PLURALS:
+            return _BROKEN_PLURALS[s]
         for suf in _AR_SUFFIXES:
             if s.endswith(suf) and len(s) - len(suf) >= 3:
                 s = s[:-len(suf)]
@@ -107,12 +186,15 @@ def stem(w):
 
 def tokens(text):
     out = []
-    for raw in _TOKEN.findall((text or "").lower()):
+    for raw in _tokenize((text or "").lower()):
         if raw in STOPWORDS:
             continue
         t = stem(raw)
-        if len(t) >= 3 and t not in STOPWORDS:
-            out.append(t)
+        # no-space-script bigrams are 1-2 chars by construction — only
+        # alphabetic tokens carry the 3-char floor (mirrors mind)
+        if (len(t) < 3 and not _NOSPACE_RE.match(t)) or t in STOPWORDS:
+            continue
+        out.append(t)
     return out
 
 

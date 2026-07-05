@@ -466,5 +466,58 @@ class TestAuditFindings(TmpTest):
         return code, out.getvalue(), err.getvalue()
 
 
+class TestMindParity(TmpTest):
+    """1.3.0 — tokenizer/stemmer parity with `mind`: Arabic broken plurals
+    unify, and CJK memories tokenize as bigrams so they consolidate at all.
+    Each case fails on the pre-1.3.0 tokenizer (jaccard 0.5 for the Arabic
+    pair; a single opaque whole-run token for the Chinese pair)."""
+
+    def test_broken_plural_singular_dedup(self):
+        # "the agents review the files" vs "the agent reviews the file":
+        # same fact, singular vs broken plural. Only the seed dictionary
+        # (قواعد≡قاعدة, وكلاء≡وكيل, ملفات≡ملف) makes them tokenize identically.
+        a = "الوكلاء يراجعون الملفات"
+        b = "الوكيل يراجع الملف"
+        d = mk([a, b])
+        d.light_sleep()
+        self.assertEqual(len(d.entries), 1,
+                         "singular + broken plural of the same fact must dedup")
+
+    def test_broken_plural_stems_match(self):
+        for sing, plur in (("قاعدة", "قواعد"), ("وظيفة", "وظائف"),
+                           ("كلمة", "كلمات"), ("ملف", "ملفات")):
+            self.assertEqual(D.stem(sing), D.stem(plur),
+                             "%s and %s must share one stem" % (sing, plur))
+
+    def test_cjk_near_duplicate_dedup(self):
+        # Chinese has no word spaces: without character bigrams each entry is
+        # one opaque token and only an identical whole run would dedup.
+        x = "数据库使用了缓存层"
+        y = "数据库使用了缓存层来加速"          # richer restatement
+        d = mk([x, y])
+        d.light_sleep()
+        self.assertEqual(len(d.entries), 1, "CJK near-duplicate must dedup")
+        self.assertEqual(d.entries[0].text, y, "the richer CJK wording is kept")
+
+    def test_cjk_distinct_facts_untouched(self):
+        # bigrams must not over-merge genuinely different CJK facts
+        x = "服务器在法兰克福"          # server is in Frankfurt
+        y = "缓存使用雷迪斯"            # cache uses Redis
+        d = mk([x, y])
+        d.light_sleep()
+        d.deep_sleep()
+        self.assertEqual(len(d.entries), 2, "unrelated CJK facts must survive")
+
+    def test_cjk_memory_file_end_to_end(self):
+        text = ("数据库使用了缓存层" + SECTION_DELIM +
+                "数据库使用了缓存层" + SECTION_DELIM +
+                "服务器在法兰克福")
+        p = self.write("MEMORY.md", text)
+        dream_file(p, {"apply": True, "quiet": True})
+        after = p.read_text("utf-8")
+        self.assertEqual(after.count("数据库使用了缓存层"), 1, "CJK dup removed")
+        self.assertIn("服务器在法兰克福", after, "distinct CJK fact kept")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.3.0 — 2026-07-05
+
+Tokenizer/stemmer parity with `mind`. `dream` and `mind` share a
+tokenizer/stemmer family; `mind` advanced it and `dream` had fallen behind.
+Consolidation quality is decided entirely by how entries tokenize, so this
+directly widens what `dream` can dedup and supersede — with no change to any
+existing behavior (all prior tests unchanged, 53 tests):
+
+- **Arabic broken plurals now unify.** A seed dictionary maps a singular and
+  its broken plural onto one stem (قاعدة≡قواعد, وظيفة≡وظائف, كلمة≡كلمات,
+  ملف≡ملفات, …), and the lookup runs on the FULL word *before* prefix
+  stripping — previously stripping a leading root letter as if it were a
+  prefix (كلمة → لمة) bypassed the dictionary entirely. Before this, a
+  singular and its broken plural stemmed to *different* tokens, so a fact
+  restated with the other number had only partial token overlap. Example:
+  «الوكلاء يراجعون الملفات» vs «الوكيل يراجع الملف» stemmed to a 50% overlap
+  (below the 0.85 near-duplicate gate) and was caught, if at all, only by the
+  looser supersession path; now the two tokenize identically and are
+  recognized as near-duplicates in light sleep (the richer wording kept).
+  More broadly, unifying singular↔plural raises token overlap everywhere
+  jaccard is used — dedup, budget-merge clustering, and the conflict flag.
+- **CJK / kana / Hangul / Thai memories now consolidate.** These scripts put
+  no spaces between meaning units, so the old tokenizer collapsed a whole
+  sentence into a single opaque token that only matched an identical run —
+  Chinese/Japanese duplicates never merged. They are now indexed as
+  character bigrams (the standard search-engine technique), so near-duplicate
+  and richer-restatement detection works across those scripts. Guarded
+  against over-merging: genuinely distinct CJK facts still survive.
+- **Stopword set aligned with `mind`** (is/be/been/being/does/did/will/its/
+  it/my/your/their), so English token overlap is measured on content words.
+
 ## 1.2.1 — 2026-07-02
 
 Follow-up to 1.2.0 (two edge cases caught by a verification pass):
