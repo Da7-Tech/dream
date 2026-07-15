@@ -792,20 +792,23 @@ class TestPersistenceHardening(TmpTest):
         self.assertNotIn("\x1b", out.getvalue())
 
     def test_hermes_home_honors_profile_and_platform_defaults(self):
+        profile = self.tmp / "profiles" / "work"
+        local = self.tmp / "local" / "appdata"
+        user = self.tmp / "users" / "example"
         self.assertEqual(
             D.hermes_home(
-                {"HERMES_HOME": "/profiles/work"},
-                os_name="posix", user_home="/users/example"),
-            Path("/profiles/work"))
+                {"HERMES_HOME": str(profile)},
+                os_name="posix", user_home=user),
+            D._absolute_path(profile))
         self.assertEqual(
             D.hermes_home(
-                {"LOCALAPPDATA": "/local/appdata"},
-                os_name="nt", user_home="/users/example"),
-            Path("/local/appdata/hermes"))
+                {"LOCALAPPDATA": str(local)},
+                os_name="nt", user_home=user),
+            D._absolute_path(local / "hermes"))
         self.assertEqual(
             D.hermes_home(
-                {}, os_name="posix", user_home="/users/example"),
-            Path("/users/example/.hermes"))
+                {}, os_name="posix", user_home=user),
+            D._absolute_path(user / ".hermes"))
 
 
 if __name__ == "__main__":
