@@ -22,3 +22,4 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python3 -m unittest discover -s tests -v
       - run: python3 bench/soak.py
+      - run: python3 bench/fuzz.py

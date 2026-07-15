@@ -5,11 +5,13 @@ Run:  python3 -m unittest discover -s tests -v
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -517,6 +519,293 @@ class TestMindParity(TmpTest):
         after = p.read_text("utf-8")
         self.assertEqual(after.count("数据库使用了缓存层"), 1, "CJK dup removed")
         self.assertIn("服务器在法兰克福", after, "distinct CJK fact kept")
+
+
+class TestPersistenceHardening(TmpTest):
+    MEMORY = ("user name is khaled from riyadh"
+              + SECTION_DELIM +
+              "project database is mysql version 5 on the old server"
+              + SECTION_DELIM +
+              "project database is postgres version 16 on the new server"
+              + SECTION_DELIM +
+              "user name is khaled from riyadh")
+
+    def test_target_symlink_is_refused(self):
+        if os.name == "nt":
+            self.skipTest("symlinks need privileges on Windows")
+        real = self.write("real.md", self.MEMORY)
+        link = self.tmp / "link.md"
+        link.symlink_to(real)
+        rc = dream_file(link, {"apply": True, "quiet": True})
+        self.assertEqual(rc, 1)
+        self.assertEqual(real.read_text("utf-8"), self.MEMORY)
+        self.assertFalse(D.pending_path(link).exists())
+
+    def test_hard_link_target_is_refused(self):
+        real = self.write("real.md", self.MEMORY)
+        linked = self.tmp / "linked.md"
+        os.link(real, linked)
+        rc = dream_file(linked, {"apply": True, "quiet": True})
+        self.assertEqual(rc, 1)
+        self.assertEqual(real.read_text("utf-8"), self.MEMORY)
+
+    def test_hard_link_archive_is_refused_before_target_change(self):
+        p = self.write("MEMORY.md", self.MEMORY)
+        other = self.write("other.md", "existing archive data")
+        os.link(other, D.archive_path(p))
+        rc = dream_file(p, {"apply": True, "quiet": True})
+        self.assertEqual(rc, 1)
+        self.assertEqual(p.read_text("utf-8"), self.MEMORY)
+        self.assertFalse(D.pending_path(p).exists())
+
+    def test_symlinked_parent_is_refused(self):
+        if os.name == "nt":
+            self.skipTest("symlinks need privileges on Windows")
+        real_dir = self.tmp / "real"
+        real_dir.mkdir()
+        target = real_dir / "MEMORY.md"
+        target.write_text(self.MEMORY, encoding="utf-8")
+        linked_dir = self.tmp / "linked"
+        linked_dir.symlink_to(real_dir, target_is_directory=True)
+        rc = dream_file(
+            linked_dir / "MEMORY.md", {"apply": True, "quiet": True})
+        self.assertEqual(rc, 1)
+        self.assertEqual(target.read_text("utf-8"), self.MEMORY)
+
+    def test_fifo_target_is_refused_without_blocking(self):
+        if not hasattr(os, "mkfifo") or os.name == "nt":
+            self.skipTest("FIFOs are POSIX-only")
+        fifo = self.tmp / "memory.fifo"
+        os.mkfifo(fifo)
+        rc = dream_file(fifo, {"quiet": True})
+        self.assertEqual(rc, 1)
+
+    def test_target_size_limit_aborts_before_writes(self):
+        p = self.write("large.md", "x" * 80)
+        with patch.object(D, "MAX_TARGET_BYTES", 32):
+            rc = dream_file(p, {"apply": True, "quiet": True})
+        self.assertEqual(rc, 1)
+        self.assertEqual(p.read_text("utf-8"), "x" * 80)
+        self.assertFalse(D.pending_path(p).exists())
+
+    def test_entry_limit_aborts_before_writes(self):
+        text = SECTION_DELIM.join(
+            "distinct memory entry number %d" % i for i in range(4))
+        p = self.write("many.md", text)
+        with patch.object(D, "MAX_ENTRIES", 3):
+            rc = dream_file(p, {"apply": True, "quiet": True})
+        self.assertEqual(rc, 1)
+        self.assertEqual(p.read_text("utf-8"), text)
+        self.assertFalse(D.pending_path(p).exists())
+
+    def test_malformed_state_value_is_repaired_without_traceback(self):
+        p = self.write("MEMORY.md", "stable project memory fact")
+        entry = Entry("stable project memory fact", 0)
+        D.state_path(p).write_text(
+            json.dumps({entry.eid: {"runs_seen": "many",
+                                    "first_seen": 17}}),
+            encoding="utf-8")
+        self.assertEqual(
+            dream_file(p, {"apply": True, "quiet": True}), 0)
+        repaired = load_state(p)
+        self.assertEqual(repaired[entry.eid]["runs_seen"], 1)
+        self.assertIsInstance(repaired[entry.eid]["first_seen"], str)
+
+    def test_comparison_budget_aborts_before_writes(self):
+        text = SECTION_DELIM.join((
+            "alpha memory about cobalt storage",
+            "bravo memory about quartz transport",
+            "charlie memory about velvet indexing",
+            "delta memory about amber routing",
+            "echo memory about silver caching",
+            "foxtrot memory about copper backups",
+        ))
+        p = self.write("work.md", text)
+        with patch.object(D, "MAX_DREAM_COMPARISONS", 2):
+            rc = dream_file(p, {"apply": True, "quiet": True})
+        self.assertEqual(rc, 1)
+        self.assertEqual(p.read_text("utf-8"), text)
+        self.assertFalse(D.pending_path(p).exists())
+
+    def test_interrupted_before_target_write_recovers(self):
+        p = self.write("MEMORY.md", self.MEMORY)
+        real_atomic = D._atomic_write
+        failed = [False]
+
+        def fail_target(path, data, *args, **kwargs):
+            if D._absolute_path(path) == D._absolute_path(p) and not failed[0]:
+                failed[0] = True
+                raise OSError("injected target interruption")
+            return real_atomic(path, data, *args, **kwargs)
+
+        with patch.object(D, "_atomic_write", side_effect=fail_target):
+            rc = dream_file(p, {"apply": True, "quiet": True})
+        self.assertEqual(rc, 1)
+        self.assertEqual(p.read_text("utf-8"), self.MEMORY)
+        self.assertTrue(D.pending_path(p).exists())
+        self.assertIn(
+            "mysql", D.archive_path(p).read_text("utf-8"),
+            "removed data must be durable before the target changes")
+
+        self.assertEqual(
+            dream_file(p, {"apply": True, "quiet": True}), 0)
+        self.assertFalse(D.pending_path(p).exists())
+        self.assertNotIn("mysql", p.read_text("utf-8"))
+        self.assertEqual(
+            D.archive_path(p).read_text("utf-8").count(
+                "project database is mysql version 5 on the old server"),
+            1, "recovery must not duplicate the archive record")
+
+    def test_interrupted_after_target_write_recovers(self):
+        p = self.write("MEMORY.md", self.MEMORY)
+        real_atomic = D._atomic_write
+        failed = [False]
+
+        def fail_journal(path, data, *args, **kwargs):
+            if D._absolute_path(path) == D.journal_path(p) and not failed[0]:
+                failed[0] = True
+                raise OSError("injected journal interruption")
+            return real_atomic(path, data, *args, **kwargs)
+
+        with patch.object(D, "_atomic_write", side_effect=fail_journal):
+            rc = dream_file(p, {"apply": True, "quiet": True})
+        self.assertEqual(rc, 1)
+        self.assertNotIn("mysql", p.read_text("utf-8"))
+        self.assertTrue(D.pending_path(p).exists())
+
+        self.assertEqual(
+            dream_file(p, {"apply": True, "quiet": True}), 0)
+        self.assertFalse(D.pending_path(p).exists())
+        self.assertIn("MEMORY.md", D.journal_path(p).read_text("utf-8"))
+
+    def test_external_target_change_is_not_clobbered(self):
+        p = self.write("MEMORY.md", self.MEMORY)
+        real_atomic = D._atomic_write
+        changed = [False]
+
+        def replace_before_commit(path, data, *args, **kwargs):
+            if D._absolute_path(path) == D._absolute_path(p) and not changed[0]:
+                changed[0] = True
+                p.write_text("external writer won", encoding="utf-8")
+            return real_atomic(path, data, *args, **kwargs)
+
+        with patch.object(D, "_atomic_write", side_effect=replace_before_commit):
+            rc = dream_file(p, {"apply": True, "quiet": True})
+        self.assertEqual(rc, 1)
+        self.assertEqual(p.read_text("utf-8"), "external writer won")
+        self.assertTrue(D.pending_path(p).exists())
+
+    def test_concurrent_same_target_serializes(self):
+        p = self.write("MEMORY.md", self.MEMORY)
+        script = Path(D.__file__).resolve()
+        processes = [
+            subprocess.Popen(
+                [sys.executable, str(script), str(p), "--apply", "--quiet"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(6)
+        ]
+        results = [
+            process.communicate(timeout=30) + (process.returncode,)
+            for process in processes
+        ]
+        self.assertTrue(
+            all(code == 0 for _, _, code in results), results)
+        self.assertEqual(p.read_text("utf-8").count("khaled"), 1)
+        self.assertNotIn("mysql", p.read_text("utf-8"))
+        self.assertEqual(
+            D.archive_path(p).read_text("utf-8").count(
+                "project database is mysql version 5 on the old server"),
+            1)
+        self.assertEqual(len(list(self.tmp.glob("MEMORY.md.bak-dream-*"))), 1)
+        self.assertFalse(D.pending_path(p).exists())
+
+    def test_concurrent_targets_preserve_shared_journal(self):
+        first = self.write("MEMORY.md", self.MEMORY)
+        second = self.write(
+            "USER.md",
+            "user likes dark mode always" + SECTION_DELIM +
+            "user likes dark mode always")
+        script = Path(D.__file__).resolve()
+        processes = [
+            subprocess.Popen(
+                [sys.executable, str(script), str(path), "--apply", "--quiet"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for path in (first, second)
+        ]
+        results = [
+            process.communicate(timeout=30) + (process.returncode,)
+            for process in processes
+        ]
+        self.assertTrue(
+            all(code == 0 for _, _, code in results), results)
+        journal = D.journal_path(first).read_text("utf-8")
+        self.assertIn("MEMORY.md", journal)
+        self.assertIn("USER.md", journal)
+
+    def test_existing_permissions_are_preserved(self):
+        if os.name == "nt":
+            self.skipTest("POSIX permission bits are not portable to Windows")
+        p = self.write("MEMORY.md", self.MEMORY)
+        p.chmod(0o640)
+        self.assertEqual(
+            dream_file(p, {"apply": True, "quiet": True}), 0)
+        self.assertEqual(p.stat().st_mode & 0o777, 0o640)
+
+    def test_atomic_write_completes_short_writes(self):
+        p = self.tmp / "short-write.md"
+        real_write = os.write
+
+        def short_write(fd, data):
+            return real_write(fd, bytes(data[:3]))
+
+        with patch.object(D.os, "write", side_effect=short_write):
+            D._atomic_write(
+                p, "abcdefghijk", boundary=self.tmp,
+                expected_identity=D._EXPECTED_MISSING)
+        self.assertEqual(p.read_text("utf-8"), "abcdefghijk")
+
+    def test_backup_names_do_not_collide_in_one_second(self):
+        p = self.write("MEMORY.md", self.MEMORY)
+        fixed = datetime(2026, 7, 15, 12, 0, 0)
+        with patch.object(D, "_now", return_value=fixed):
+            self.assertEqual(
+                dream_file(p, {"apply": True, "quiet": True}), 0)
+            current = p.read_text("utf-8")
+            p.write_text(
+                current + SECTION_DELIM + "second duplicate fact" +
+                SECTION_DELIM + "second duplicate fact", encoding="utf-8")
+            self.assertEqual(
+                dream_file(p, {"apply": True, "quiet": True}), 0)
+        self.assertEqual(
+            len(list(self.tmp.glob("MEMORY.md.bak-dream-*"))), 2)
+
+    def test_terminal_controls_are_not_emitted(self):
+        import io
+        from contextlib import redirect_stdout
+        p = self.write(
+            "MEMORY.md",
+            "danger \x1b[31m red fact" + SECTION_DELIM +
+            "danger \x1b[31m red fact")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(dream_file(p, {}), 0)
+        self.assertNotIn("\x1b", out.getvalue())
+
+    def test_hermes_home_honors_profile_and_platform_defaults(self):
+        self.assertEqual(
+            D.hermes_home(
+                {"HERMES_HOME": "/profiles/work"},
+                os_name="posix", user_home="/users/example"),
+            Path("/profiles/work"))
+        self.assertEqual(
+            D.hermes_home(
+                {"LOCALAPPDATA": "/local/appdata"},
+                os_name="nt", user_home="/users/example"),
+            Path("/local/appdata/hermes"))
+        self.assertEqual(
+            D.hermes_home(
+                {}, os_name="posix", user_home="/users/example"),
+            Path("/users/example/.hermes"))
 
 
 if __name__ == "__main__":

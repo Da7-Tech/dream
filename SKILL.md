@@ -1,8 +1,8 @@
 ---
 name: dream
 description: Sleep-cycle cleanup for agent memory files, budget-safe.
-version: 1.3.0
-author: Da7 (Da7-Tech)
+version: 1.4.0
+author: Da7_Tech
 license: MIT
 platforms: [linux, macos, windows]
 prerequisites:
@@ -17,8 +17,8 @@ metadata:
 
 # dream Skill
 
-Consolidates the agent's own memory files (`~/.hermes/memories/MEMORY.md`,
-`USER.md`) offline and deterministically: deduplicates, keeps the newest
+Consolidates the active Hermes profile's `MEMORY.md` and `USER.md` offline
+and deterministically: deduplicates, keeps the newest
 statement of a repeated subject, flags uncertain contradictions, and can
 squeeze the file under its exact character budget — with zero LLM calls
 (the char accounting matches Hermes' `§`-join math character-for-character — the same `len()` codepoint count Hermes uses). It does
@@ -37,7 +37,7 @@ removed entry is archived with a written reason.
 
 - `python3` (3.9+) and `curl` on PATH — no API keys, no server, no
   packages. The tool is one stdlib-only file, MIT-licensed, from
-  https://github.com/Da7-Tech/dream (53 tests + a 90-day soak test run in
+  https://github.com/Da7-Tech/dream (72 tests + a 90-day soak test run in
   its CI on Linux/macOS/Windows).
 
 ## How to Run
@@ -45,20 +45,40 @@ removed entry is archived with a written reason.
 Install once through the `terminal` tool, pinned to a release tag and
 integrity-checked:
 
+POSIX shell (Linux/macOS):
+
 ```bash
-mkdir -p ~/.hermes/tools && cd ~/.hermes/tools
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.3.0/dream.py
-python3 -c "import hashlib;h=hashlib.sha256(open('dream.py','rb').read()).hexdigest();assert h=='d33bdfaeb182521a0c3710263d3f096523cc7ac1750a581e1bcc826cd2a3b5c0',h;print('dream.py: OK')"
+HERMES_ROOT="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_ROOT/tools"
+cd "$HERMES_ROOT/tools"
+curl -fsSLo dream.py https://raw.githubusercontent.com/Da7-Tech/dream/v1.4.0/dream.py
+python3 -c "import hashlib;h=hashlib.sha256(open('dream.py','rb').read()).hexdigest();assert h=='616997cb6caa4de403e34a1153fe9d15ec8196246039393946d1cb2fb06aa052',h;print('dream.py: OK')"
+```
+
+PowerShell (Windows):
+
+```powershell
+$HermesRoot = if ($env:HERMES_HOME) {
+  $env:HERMES_HOME
+} else {
+  Join-Path $env:LOCALAPPDATA "hermes"
+}
+$Tools = Join-Path $HermesRoot "tools"
+New-Item -ItemType Directory -Force $Tools | Out-Null
+$Dream = Join-Path $Tools "dream.py"
+Invoke-WebRequest "https://raw.githubusercontent.com/Da7-Tech/dream/v1.4.0/dream.py" -OutFile $Dream
+$Hash = (Get-FileHash $Dream -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($Hash -ne "616997cb6caa4de403e34a1153fe9d15ec8196246039393946d1cb2fb06aa052") { throw "dream.py checksum mismatch: $Hash" }
 ```
 
 ## Quick Reference
 
 | User intent | Command (through `terminal`) |
 |---|---|
-| "Clean up my memory" | `python3 ~/.hermes/tools/dream.py --hermes` (dry run) |
+| "Clean up my memory" | run the installed `dream.py --hermes` (dry run) |
 | Apply after approval | add `--apply` |
-| "Memory is over its limit" | `python3 ~/.hermes/tools/dream.py --hermes --apply` (budgets auto-read from `config.yaml`) |
-| Consolidate any notes file | `python3 ~/.hermes/tools/dream.py <file>` then `--apply` |
+| "Memory is over its limit" | run `dream.py --hermes --apply` (budgets auto-read from the active profile's `config.yaml`) |
+| Consolidate any notes file | run `dream.py <file>` then add `--apply` |
 
 ## Procedure
 
@@ -69,15 +89,36 @@ python3 -c "import hashlib;h=hashlib.sha256(open('dream.py','rb').read()).hexdig
    appends a report to `DREAMS.md`.
 3. Report `entries: N -> M | chars: X -> Y` plus backup/archive paths.
    Never say an entry was "deleted" — it was archived.
-4. Nightly automation costs zero tokens via the `cronjob` tool in no-agent
-   mode (the script IS the job — no model call):
+4. Nightly automation costs zero tokens. Use the Hermes `cronjob` tool on
+   POSIX; use Windows Task Scheduler on native Windows.
+
+POSIX only:
 
 ```bash
-cat > ~/.hermes/scripts/dream_nightly.sh <<'EOF'
+HERMES_ROOT="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_ROOT/scripts"
+cat > "$HERMES_ROOT/scripts/dream_nightly.sh" <<'EOF'
 #!/bin/bash
-python3 ~/.hermes/tools/dream.py --hermes --apply --quiet
+set -eu
+HERMES_ROOT="${HERMES_HOME:-$HOME/.hermes}"
+python3 "$HERMES_ROOT/tools/dream.py" --hermes --apply --quiet
 EOF
 hermes cron create "0 4 * * *" --name memory-dream --script dream_nightly.sh --no-agent
+```
+
+Native Windows:
+
+```powershell
+$HermesRoot = if ($env:HERMES_HOME) {
+  $env:HERMES_HOME
+} else {
+  Join-Path $env:LOCALAPPDATA "hermes"
+}
+$Python = (Get-Command python).Source
+$Dream = Join-Path $HermesRoot "tools\dream.py"
+$Action = New-ScheduledTaskAction -Execute $Python -Argument "`"$Dream`" --hermes --apply --quiet"
+$Trigger = New-ScheduledTaskTrigger -Daily -At 4am
+Register-ScheduledTask -TaskName "Hermes memory dream" -Action $Action -Trigger $Trigger
 ```
 
 ## Pitfalls
@@ -86,15 +127,38 @@ hermes cron create "0 4 * * *" --name memory-dream --script dream_nightly.sh --n
   memory). For non-chronological files use `--no-supersede`.
 - Merging is deterministic clause algebra, not LLM rewriting — wording can
   be mechanical; information is preserved.
-- Pairwise comparison is O(n²): instant for memory-sized files, not meant
-  for megabyte corpora.
+- Pairwise comparison is O(n²), with hard ceilings: 10 MB, 10,000 entries,
+  and 200,000 comparisons. A limit failure writes no semantic change.
 - Apply is idempotent (unit-tested): a second run on clean memory changes
   nothing.
+- `HERMES_HOME` always selects the profile. Without it, the native defaults
+  are `~/.hermes` on POSIX and `%LOCALAPPDATA%/hermes` on Windows.
 
 ## Verification
 
+POSIX:
+
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/dream/v1.3.0/dream.py && python3 -c "import hashlib;h=hashlib.sha256(open('dream.py','rb').read()).hexdigest();assert h=='d33bdfaeb182521a0c3710263d3f096523cc7ac1750a581e1bcc826cd2a3b5c0',h;print('OK')" && printf 'user name is khalid\n§\nuser name is khalid' > MEMORY.md && python3 dream.py MEMORY.md --apply --quiet && cat MEMORY.md
+tmp="$(mktemp -d)"
+cd "$tmp"
+curl -fsSLo dream.py https://raw.githubusercontent.com/Da7-Tech/dream/v1.4.0/dream.py
+python3 -c "import hashlib;h=hashlib.sha256(open('dream.py','rb').read()).hexdigest();assert h=='616997cb6caa4de403e34a1153fe9d15ec8196246039393946d1cb2fb06aa052',h;print('OK')"
+printf 'user name is khalid\n§\nuser name is khalid' > MEMORY.md
+python3 dream.py MEMORY.md --apply --quiet
+cat MEMORY.md
+```
+
+PowerShell:
+
+```powershell
+$Tmp = Join-Path $env:TEMP ("dream-" + [guid]::NewGuid())
+New-Item -ItemType Directory $Tmp | Out-Null
+Set-Location $Tmp
+Invoke-WebRequest "https://raw.githubusercontent.com/Da7-Tech/dream/v1.4.0/dream.py" -OutFile dream.py
+if ((Get-FileHash dream.py -Algorithm SHA256).Hash.ToLowerInvariant() -ne "616997cb6caa4de403e34a1153fe9d15ec8196246039393946d1cb2fb06aa052") { throw "checksum mismatch" }
+[IO.File]::WriteAllText((Join-Path $Tmp "MEMORY.md"), "user name is khalid`n§`nuser name is khalid")
+python dream.py MEMORY.md --apply --quiet
+Get-Content MEMORY.md
 ```
 
 Expected: `MEMORY.md consolidated: 2 -> 1 entries, ...` and the file

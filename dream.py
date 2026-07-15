@@ -23,7 +23,7 @@ Sleep phases:
 Usage:
   python3 dream.py <memory-file>            preview (dry run, default)
   python3 dream.py <memory-file> --apply    write changes (+backup +journal)
-  python3 dream.py --hermes [--apply]       consolidate ~/.hermes/memories/*
+  python3 dream.py --hermes [--apply]       consolidate the active Hermes profile
 Options:
   --budget N     enforce a character budget (Hermes MEMORY.md limit: 2200)
   --format F     auto | sections | bullets | paragraphs   (default: auto)
@@ -34,12 +34,13 @@ Options:
 
 License: MIT  |  https://github.com/Da7-Tech/dream
 """
-import sys, os, re, json, math, difflib, hashlib
+import sys, os, re, json, math, difflib, hashlib, time, tempfile, stat, threading
 from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 def _now():
     """Injectable clock — the soak test drives simulated months through it."""
@@ -56,6 +57,28 @@ CONFLICT_BODY_LO = 0.25
 MERGE_CLUSTER_SIM = 0.50
 SUBJECT_TOKENS = 6
 JOURNAL_MAX_BYTES = 64 * 1024
+MAX_TARGET_BYTES = 10_000_000
+MAX_SIDE_BYTES = 10_000_000
+MAX_PENDING_BYTES = 50_000_000
+MAX_ENTRIES = 10_000
+MAX_DREAM_COMPARISONS = 200_000
+LOCK_TIMEOUT_SECONDS = 30.0
+
+
+class UnsafePathError(ValueError):
+    """A dream artifact is not a private regular file."""
+
+
+class FileLimitError(ValueError):
+    """An input or operation exceeds a documented resource bound."""
+
+
+class StaleTargetError(ValueError):
+    """A file changed after it was read for a preserving rewrite."""
+
+
+_NO_EXPECTATION = object()
+_EXPECTED_MISSING = object()
 
 
 # ────────────────────────────────────────────────────────────────
@@ -225,21 +248,436 @@ def _same_sequence(a, b):
     return sa == sb
 
 
-def _atomic_write(path, data):
-    """Atomic, durable, symlink-refusing write: fsync before rename so
-    the new content survives power loss, not just process crashes."""
-    path = Path(path)
-    if path.is_symlink():
-        raise ValueError("refusing to write through a symlink: %s" % path)
-    tmp = str(path) + ".tmp"
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | nofollow | os.O_TRUNC, 0o644)
+def _absolute_path(path):
+    """Expand a path without resolving away a final symlink."""
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _identity(info):
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+
+
+def _reject_symlinked_parents(path, boundary):
+    """Reject a symlinked parent or a path outside the trust boundary."""
+    boundary = os.path.abspath(str(boundary))
+    current = os.path.abspath(str(Path(path).parent))
+    while True:
+        if os.path.islink(current):
+            raise UnsafePathError(
+                "refusing to use a symlinked parent: %s" % current)
+        if current == boundary:
+            return
+        parent = os.path.dirname(current)
+        if parent == current:
+            raise UnsafePathError(
+                "path %s escapes boundary %s" % (path, boundary))
+        current = parent
+
+
+def _open_regular(path, flags, mode=0o600, boundary=None):
+    """Open one private regular file without following or blocking on it."""
+    path = _absolute_path(path)
+    boundary = _absolute_path(boundary or path.parent)
+    before = None
+    if os.name == "nt":
+        _reject_symlinked_parents(path, boundary)
+        if path.is_symlink():
+            raise UnsafePathError("refusing symlink file %s" % path)
+        try:
+            before = os.lstat(str(path))
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise UnsafePathError("refusing unsafe file %s" % path)
+        except FileNotFoundError:
+            before = None
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    parent_fd = None
     try:
-        os.write(fd, data.encode("utf-8"))
-        os.fsync(fd)
+        if os.name != "nt" and os.open in getattr(os, "supports_dir_fd", set()):
+            try:
+                relative = path.relative_to(boundary)
+            except ValueError:
+                raise UnsafePathError(
+                    "file %s escapes boundary %s" % (path, boundary))
+            dir_flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                         getattr(os, "O_NOFOLLOW", 0))
+            parent_fd = os.open(str(boundary), dir_flags)
+            for part in relative.parent.parts:
+                next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = next_fd
+            for attempt in range(20):
+                try:
+                    fd = os.open(path.name, flags, mode, dir_fd=parent_fd)
+                    break
+                except FileNotFoundError:
+                    if not (flags & os.O_CREAT) or attempt == 19:
+                        raise
+                    time.sleep(0.005)
+        else:
+            _reject_symlinked_parents(path, boundary)
+            if path.is_symlink():
+                raise UnsafePathError("refusing symlink file %s" % path)
+            fd = os.open(str(path), flags, mode)
+    except OSError as exc:
+        if isinstance(exc, (FileNotFoundError, PermissionError)):
+            raise
+        raise UnsafePathError(
+            "refusing unsafe file %s: %s" % (path, exc))
     finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+    try:
+        info = os.fstat(fd)
+        read_only = (flags & getattr(os, "O_ACCMODE", 3)) == os.O_RDONLY
+        valid_links = info.st_nlink in ((0, 1) if read_only else (1,))
+        if not stat.S_ISREG(info.st_mode) or not valid_links:
+            raise UnsafePathError(
+                "refusing %s: regular, single-link file required" % path)
+        if os.name == "nt":
+            try:
+                after = os.lstat(str(path))
+            except FileNotFoundError:
+                raise StaleTargetError(
+                    "file changed during open: %s" % path)
+            if (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+                raise StaleTargetError(
+                    "file changed during open: %s" % path)
+            if before is not None and (
+                    before.st_dev, before.st_ino) != (
+                    after.st_dev, after.st_ino):
+                raise StaleTargetError(
+                    "file changed during open: %s" % path)
+        return fd
+    except BaseException:
         os.close(fd)
-    os.replace(tmp, str(path))
+        raise
+
+
+def _read_text_retry(path, max_bytes=MAX_SIDE_BYTES, with_identity=False,
+                     boundary=None):
+    """Read a bounded regular UTF-8 file, retrying Windows replace races."""
+    for attempt in range(200):
+        try:
+            fd = _open_regular(
+                path, os.O_RDONLY, boundary=boundary or Path(path).parent)
+            try:
+                before = os.fstat(fd)
+                if before.st_size > max_bytes:
+                    raise FileLimitError(
+                        "%s exceeds the %d-byte limit" % (path, max_bytes))
+                chunks = []
+                remaining = max_bytes + 1
+                while remaining:
+                    chunk = os.read(fd, min(1_048_576, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                payload = b"".join(chunks)
+                if len(payload) > max_bytes:
+                    raise FileLimitError(
+                        "%s exceeds the %d-byte limit" % (path, max_bytes))
+                after = os.fstat(fd)
+                if _identity(before) != _identity(after):
+                    if attempt == 199:
+                        raise StaleTargetError(
+                            "%s changed while it was being read" % path)
+                    continue
+                text = payload.decode("utf-8")
+                return (text, _identity(after)) if with_identity else text
+            finally:
+                os.close(fd)
+        except PermissionError:
+            if os.name != "nt" or attempt == 199:
+                raise
+            time.sleep(0.05)
+        except StaleTargetError:
+            if attempt == 199:
+                raise
+            time.sleep(0.005)
+
+
+def _read_optional(path, max_bytes=MAX_SIDE_BYTES, with_identity=False,
+                   boundary=None):
+    try:
+        return _read_text_retry(
+            path, max_bytes=max_bytes, with_identity=with_identity,
+            boundary=boundary)
+    except FileNotFoundError:
+        return ("", _EXPECTED_MISSING) if with_identity else ""
+
+
+def _write_all(fd, data):
+    """Write every byte or raise; os.write may legally return short."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write: os.write made no progress")
+        view = view[written:]
+
+
+def _atomic_write(path, data, boundary=None,
+                  expected_identity=_NO_EXPECTATION, mode=0o600):
+    """Atomic, durable, private-file write with stale-target detection."""
+    path = _absolute_path(path)
+    boundary = _absolute_path(boundary or path.parent)
+    payload = data.encode("utf-8") if isinstance(data, str) else data
+
+    if os.name != "nt" and os.rename in getattr(
+            os, "supports_dir_fd", set()):
+        try:
+            relative = path.relative_to(boundary)
+        except ValueError:
+            raise UnsafePathError(
+                "path %s escapes boundary %s" % (path, boundary))
+        dir_flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                     getattr(os, "O_NOFOLLOW", 0))
+        try:
+            parent_fd = os.open(str(boundary), dir_flags)
+        except OSError as exc:
+            raise UnsafePathError(
+                "refusing unsafe boundary %s: %s" % (boundary, exc))
+        try:
+            for part in relative.parent.parts:
+                next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = next_fd
+            target_mode = mode
+            try:
+                current = os.stat(
+                    path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                current = None
+            current_identity = (
+                _identity(current) if current is not None
+                else _EXPECTED_MISSING)
+            if expected_identity is not _NO_EXPECTATION and \
+                    current_identity != expected_identity:
+                raise StaleTargetError(
+                    "%s changed after it was read" % path)
+            if current is not None:
+                if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+                    raise UnsafePathError(
+                        "refusing unsafe atomic-write target: %s" % path)
+                target_mode = stat.S_IMODE(current.st_mode)
+            tmp_name = ".%s.%d.%d.%d.tmp" % (
+                path.name, os.getpid(), threading.get_ident(), time.time_ns())
+            fd = os.open(
+                tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                getattr(os, "O_NOFOLLOW", 0), target_mode, dir_fd=parent_fd)
+            replaced = False
+            try:
+                try:
+                    try:
+                        os.fchmod(fd, target_mode)
+                    except (AttributeError, OSError):
+                        pass
+                    _write_all(fd, payload)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                    fd = None
+                if expected_identity is not _NO_EXPECTATION:
+                    try:
+                        latest = os.stat(
+                            path.name, dir_fd=parent_fd,
+                            follow_symlinks=False)
+                        latest_identity = _identity(latest)
+                    except FileNotFoundError:
+                        latest_identity = _EXPECTED_MISSING
+                    if latest_identity != expected_identity:
+                        raise StaleTargetError(
+                            "%s changed during rewrite" % path)
+                os.replace(
+                    tmp_name, path.name, src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd)
+                replaced = True
+                os.fsync(parent_fd)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+                if not replaced:
+                    try:
+                        os.unlink(tmp_name, dir_fd=parent_fd)
+                    except OSError:
+                        pass
+        finally:
+            os.close(parent_fd)
+        return
+
+    if path.is_symlink():
+        raise UnsafePathError(
+            "refusing to write through a symlink: %s" % path)
+    _reject_symlinked_parents(path, boundary)
+    target_mode = mode
+    if path.exists():
+        current = os.lstat(str(path))
+        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            raise UnsafePathError(
+                "refusing unsafe atomic-write target: %s" % path)
+        target_mode = stat.S_IMODE(current.st_mode)
+        current_identity = _identity(current)
+    else:
+        current_identity = _EXPECTED_MISSING
+    if expected_identity is not _NO_EXPECTATION and \
+            current_identity != expected_identity:
+        raise StaleTargetError("%s changed after it was read" % path)
+    fd, tmp = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    replaced = False
+    try:
+        try:
+            try:
+                os.fchmod(fd, target_mode)
+            except (AttributeError, OSError):
+                pass
+            _write_all(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+            fd = None
+        if expected_identity is not _NO_EXPECTATION:
+            if path.exists():
+                latest_identity = _identity(os.lstat(str(path)))
+            else:
+                latest_identity = _EXPECTED_MISSING
+            if latest_identity != expected_identity:
+                raise StaleTargetError(
+                    "%s changed during rewrite" % path)
+        for attempt in range(200):
+            try:
+                os.replace(tmp, str(path))
+                replaced = True
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 199:
+                    raise
+                time.sleep(0.05)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if not replaced:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+@contextmanager
+def _exclusive_file_lock(path, boundary, timeout=LOCK_TIMEOUT_SECONDS):
+    """Portable advisory lock for the complete read-plan-commit cycle."""
+    fd = _open_regular(
+        path, os.O_RDWR | os.O_CREAT, boundary=boundary)
+    lockf = os.fdopen(fd, "r+b", buffering=0)
+    backend = None
+    try:
+        if os.fstat(lockf.fileno()).st_size == 0:
+            lockf.write(b"\0")
+            lockf.flush()
+            os.fsync(lockf.fileno())
+        try:
+            import fcntl
+        except ImportError:
+            try:
+                import msvcrt
+            except ImportError:
+                raise RuntimeError("no supported file-lock backend")
+            deadline = time.monotonic() + timeout
+            mode = getattr(msvcrt, "LK_NBLCK", msvcrt.LK_LOCK)
+            while True:
+                lockf.seek(0)
+                try:
+                    msvcrt.locking(lockf.fileno(), mode, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError(
+                            "could not acquire %s within %.1f seconds"
+                            % (path, timeout))
+                    time.sleep(0.05)
+            backend = ("msvcrt", msvcrt)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(
+                        lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError(
+                            "could not acquire %s within %.1f seconds"
+                            % (path, timeout))
+                    time.sleep(0.05)
+            backend = ("fcntl", fcntl)
+        yield
+    finally:
+        if backend is not None:
+            name, module = backend
+            if name == "fcntl":
+                module.flock(lockf.fileno(), module.LOCK_UN)
+            else:
+                lockf.seek(0)
+                module.locking(lockf.fileno(), module.LK_UNLCK, 1)
+        lockf.close()
+
+
+def _unlink_regular(path, boundary, expected_identity=None):
+    """Remove only the exact private regular file expected by the caller."""
+    path = _absolute_path(path)
+    boundary = _absolute_path(boundary)
+    if os.name != "nt" and os.unlink in getattr(
+            os, "supports_dir_fd", set()):
+        relative = path.relative_to(boundary)
+        dir_flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                     getattr(os, "O_NOFOLLOW", 0))
+        parent_fd = os.open(str(boundary), dir_flags)
+        try:
+            for part in relative.parent.parts:
+                next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = next_fd
+            info = os.stat(
+                path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise UnsafePathError(
+                    "refusing to remove unsafe file %s" % path)
+            if expected_identity is not None and \
+                    _identity(info) != expected_identity:
+                raise StaleTargetError(
+                    "%s changed before removal" % path)
+            os.unlink(path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        return
+    _reject_symlinked_parents(path, boundary)
+    info = os.lstat(str(path))
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise UnsafePathError(
+            "refusing to remove unsafe file %s" % path)
+    if expected_identity is not None and _identity(info) != expected_identity:
+        raise StaleTargetError("%s changed before removal" % path)
+    for attempt in range(200):
+        try:
+            os.unlink(str(path))
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == 199:
+                raise
+            time.sleep(0.05)
+
+
+_TERMINAL_CONTROLS = re.compile(
+    u"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f"
+    u"\u202a-\u202e\u2066-\u2069\ud800-\udfff]")
+
+
+def _terminal_text(value):
+    """Preserve layout while removing terminal and bidi control codes."""
+    return _TERMINAL_CONTROLS.sub("", str(value))
 
 
 # ────────────────────────────────────────────────────────────────
@@ -371,6 +809,10 @@ def _short(t, n=100):
 
 class Dreamer:
     def __init__(self, entries, fmt, opts):
+        if len(entries) > MAX_ENTRIES:
+            raise FileLimitError(
+                "memory has %d entries; limit is %d"
+                % (len(entries), MAX_ENTRIES))
         # only bullets mode has structural headers; in sections/paragraphs a
         # leading '#' is ordinary content
         hdr = fmt == "bullets"
@@ -381,6 +823,22 @@ class Dreamer:
         self.actions = []
         self.flags = []       # journal-only observations
         self.themes = []
+        self.comparisons = 0
+
+    def _spend_comparisons(self, count=1):
+        if self.comparisons + count > MAX_DREAM_COMPARISONS:
+            raise FileLimitError(
+                "dream comparison budget exceeded (%d)"
+                % MAX_DREAM_COMPARISONS)
+        self.comparisons += count
+
+    def _pair_scores(self, a, b):
+        self._spend_comparisons()
+        return jaccard(a, b), containment(a, b)
+
+    def _pair_jaccard(self, a, b):
+        self._spend_comparisons()
+        return jaccard(a, b)
 
     # -- light sleep: duplicates ------------------------------------
     def light_sleep(self):
@@ -402,11 +860,12 @@ class Dreamer:
                 kept.append(e)
                 continue
             dup_of = None
+            dup_score = 0.0
             for k in kept:
                 if k.is_header:
                     continue
-                if (jaccard(e.toks, k.toks) >= NEAR_DUP_JACCARD or
-                        containment(e.toks, k.toks) >= NEAR_DUP_CONTAINMENT):
+                jac, con = self._pair_scores(e.toks, k.toks)
+                if jac >= NEAR_DUP_JACCARD or con >= NEAR_DUP_CONTAINMENT:
                     # Same token BAG isn't the same fact if the words are in a
                     # different ORDER: "A calls B" vs "B calls A", "prefers
                     # tabs over spaces" vs "prefers spaces over tabs" are
@@ -416,6 +875,7 @@ class Dreamer:
                     # conflict scan instead (auditor finding).
                     if _same_sequence(e.toks, k.toks):
                         dup_of = k
+                        dup_score = jac
                         break
             if dup_of is None:
                 kept.append(e)
@@ -433,7 +893,7 @@ class Dreamer:
                 self.actions.append(Action(
                     "light", "near-duplicate",
                     "same fact worded twice (%.0f%% token overlap); kept the richer wording"
-                    % (jaccard(e.toks, dup_of.toks) * 100),
+                    % (dup_score * 100),
                     removed=poor.text, result=rich.text))
         self.entries = kept
 
@@ -450,6 +910,7 @@ class Dreamer:
                     continue
                 if a.eid in removed or b.eid in removed:
                     continue
+                self._spend_comparisons()
                 sj = jaccard(a.subject(), b.subject())
                 bj = jaccard(a.toks, b.toks)
                 if sj >= SUPERSEDE_SUBJECT_J and SUPERSEDE_BODY_LO <= bj < SUPERSEDE_BODY_HI:
@@ -479,11 +940,14 @@ class Dreamer:
             if e.is_header:          # structure never ages out
                 kept.append(e)
                 continue
-            first_seen = state.get(e.eid, {}).get("first_seen")
-            if first_seen:
+            entry_state = state.get(e.eid, {})
+            first_seen = (
+                entry_state.get("first_seen")
+                if isinstance(entry_state, dict) else None)
+            if isinstance(first_seen, str) and first_seen:
                 try:
                     age = (now - datetime.fromisoformat(first_seen)).days
-                except ValueError:
+                except (TypeError, ValueError):
                     age = 0
                 if age > max_age_days:
                     self.actions.append(Action(
@@ -523,7 +987,8 @@ class Dreamer:
                     for j in range(i + 1, len(es)):
                         if es[i].is_header or es[j].is_header:
                             continue     # never merge a structural header
-                        sim = jaccard(es[i].toks, es[j].toks)
+                        sim = self._pair_jaccard(
+                            es[i].toks, es[j].toks)
                         # same leading subject (identical first 3 stemmed
                         # tokens) is merge-eligible even at lower overlap
                         same_lead = (len(es[i].toks) >= 3 and
@@ -555,7 +1020,14 @@ class Dreamer:
             candidates = [e for e in self.entries if not e.is_header]
             if len(candidates) <= 1:
                 break
-            victim = min(candidates, key=self._info_density)
+            self._spend_comparisons(len(candidates))
+            frequencies = Counter()
+            for entry in candidates:
+                frequencies.update(set(entry.toks))
+            victim = min(
+                candidates,
+                key=lambda entry: self._info_density(
+                    entry, frequencies))
             self.entries.remove(victim)
             self.actions.append(Action(
                 "squeeze", "archived-for-budget",
@@ -603,12 +1075,14 @@ class Dreamer:
                         "cut at a word boundary to honor the hard limit",
                         removed=tail, result=cut.strip()))
 
-    def _info_density(self, entry):
-        others = Counter()
-        for e in self.entries:
-            if e is not entry:
-                others.update(set(e.toks))
-        unique = sum(1 for t in set(entry.toks) if others[t] == 0)
+    def _info_density(self, entry, frequencies=None):
+        if frequencies is None:
+            frequencies = Counter()
+            for candidate in self.entries:
+                frequencies.update(set(candidate.toks))
+        unique = sum(
+            1 for token in set(entry.toks)
+            if frequencies[token] == 1)
         return (unique + 0.1) / max(1, len(entry.text))
 
 
@@ -635,202 +1109,523 @@ def _merge_texts(base, other):
 # ────────────────────────────────────────────────────────────────
 # State, archive, journal
 # ────────────────────────────────────────────────────────────────
-def _preflight_apply_paths(target):
-    """Return the first side-file path that could NOT be written safely
-    (symlink, or its parent isn't a writable directory), or None if all are
-    clear. Checked before the target is overwritten so apply is all-or-nothing."""
-    candidates = [
-        target.parent / ("%s.dream-archive.md" % target.name),
-        target.parent / "DREAMS.md",
-        state_path(target),
-        target.parent / ("%s.bak-dream-preflight" % target.name),
-    ]
-    for p in candidates:
-        if p.is_symlink():
-            return str(p)
-        if p.is_dir():                      # a directory where a file must go
-            return str(p)
-        if p.exists() and not os.access(str(p), os.W_OK):
-            return str(p)
-    # the directory itself must be writable (for the tmp + rename dance)
-    if not os.access(str(target.parent), os.W_OK):
-        return str(target.parent)
-    return None
-
-
 def state_path(target):
     return target.parent / (".%s.dream-state.json" % target.name)
 
 
-def load_state(target):
+def archive_path(target):
+    return target.parent / ("%s.dream-archive.md" % target.name)
+
+
+def journal_path(target):
+    return target.parent / "DREAMS.md"
+
+
+def pending_path(target):
+    return target.parent / (".%s.dream-pending.json" % target.name)
+
+
+def lock_path(target):
+    # Shared by every target in this directory because DREAMS.md is shared.
+    return target.parent / ".dream.lock"
+
+
+def _load_state_snapshot(target):
     p = state_path(target)
-    if p.exists():
-        try:
-            return json.loads(p.read_text("utf-8"))
-        except (json.JSONDecodeError, ValueError):
-            return {}
-    return {}
+    raw, identity = _read_optional(
+        p, max_bytes=MAX_SIDE_BYTES, with_identity=True,
+        boundary=target.parent)
+    if not raw:
+        return {}, raw, identity
+    try:
+        state = json.loads(raw)
+        if not isinstance(state, dict):
+            state = {}
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        state = {}
+    return state, raw, identity
 
 
-def save_state(target, entries, old_state):
+def load_state(target):
+    target = _absolute_path(target)
+    state, _, _ = _load_state_snapshot(target)
+    return state
+
+
+def _state_text(entries, old_state):
     now = _now().isoformat(timespec="seconds")
+    if not isinstance(old_state, dict):
+        old_state = {}
     st = {}
     for e in entries:
         prev = old_state.get(e.eid, {})
+        if not isinstance(prev, dict):
+            prev = {}
+        first_seen = prev.get("first_seen")
+        if not isinstance(first_seen, str):
+            first_seen = now
+        runs_seen = prev.get("runs_seen", 0)
+        if isinstance(runs_seen, bool) or not isinstance(runs_seen, int) or \
+                runs_seen < 0:
+            runs_seen = 0
         st[e.eid] = {
-            "first_seen": prev.get("first_seen", now),
+            "first_seen": first_seen,
             "last_seen": now,
-            "runs_seen": prev.get("runs_seen", 0) + 1,
+            "runs_seen": runs_seen + 1,
             "preview": _short(e.text, 60),
         }
-    _atomic_write(state_path(target), json.dumps(st, ensure_ascii=False, indent=1))
+    return json.dumps(st, ensure_ascii=False, indent=1)
 
 
-def append_archive(target, actions):
-    arch = target.parent / ("%s.dream-archive.md" % target.name)
+def save_state(target, entries, old_state):
+    target = _absolute_path(target)
+    path = state_path(target)
+    _, identity = _read_optional(
+        path, max_bytes=MAX_SIDE_BYTES, with_identity=True,
+        boundary=target.parent)
+    _atomic_write(
+        path, _state_text(entries, old_state), boundary=target.parent,
+        expected_identity=identity)
+
+
+def _archive_block(actions, stamp):
     lines = []
+    for action in actions:
+        if action.removed:
+            lines.append(
+                "## %s — %s (%s)\n\n%s\n"
+                % (stamp, action.kind, action.reason, action.removed))
+    return "\n".join(lines)
+
+
+def _append_marked_file(path, header, marker, block, max_bytes,
+                        rotate=False):
+    """Append idempotently under the directory lock using atomic rewrite."""
+    boundary = path.parent
+    for attempt in range(20):
+        previous, identity = _read_optional(
+            path, max_bytes=max_bytes, with_identity=True,
+            boundary=boundary)
+        if marker in previous:
+            return path
+        base = previous or header
+        if base and not base.endswith("\n"):
+            base += "\n"
+        text = base + marker + "\n" + block.rstrip() + "\n"
+        if len(text.encode("utf-8")) > max_bytes:
+            if not rotate:
+                raise FileLimitError(
+                    "%s exceeds the %d-byte limit" % (path, max_bytes))
+            text = (header.rstrip() + " (rotated)\n\n" + marker + "\n" +
+                    block.rstrip() + "\n")
+            if len(text.encode("utf-8")) > max_bytes:
+                raise FileLimitError(
+                    "one journal record exceeds the %d-byte limit"
+                    % max_bytes)
+        try:
+            _atomic_write(
+                path, text, boundary=boundary,
+                expected_identity=identity)
+            return path
+        except StaleTargetError:
+            if attempt == 19:
+                raise
+
+
+def append_archive(target, actions, transaction_id=None):
+    target = _absolute_path(target)
     stamp = _now().strftime("%Y-%m-%d %H:%M")
-    for a in actions:
-        if a.removed:
-            lines.append("## %s — %s (%s)\n\n%s\n" % (stamp, a.kind, a.reason, a.removed))
-    if not lines:
+    block = _archive_block(actions, stamp)
+    if not block:
         return None
-    prev = arch.read_text("utf-8") if arch.exists() else "# dream archive — nothing is ever deleted, only moved here\n\n"
-    _atomic_write(arch, prev + "\n".join(lines) + "\n")
-    return arch
+    txid = transaction_id or hashlib.sha256(
+        block.encode("utf-8")).hexdigest()[:24]
+    return _append_marked_file(
+        archive_path(target),
+        "# dream archive — nothing is ever deleted, only moved here\n\n",
+        "<!-- dream-tx:%s -->" % txid,
+        block, MAX_SIDE_BYTES)
 
 
-def append_journal(target, report):
-    j = target.parent / "DREAMS.md"
-    prev = j.read_text("utf-8") if j.exists() else "# DREAMS.md — dream journal\n\n"
-    text = prev + report + "\n"
-    if len(text.encode("utf-8")) > JOURNAL_MAX_BYTES:      # rotate: keep tail
-        text = "# DREAMS.md — dream journal (rotated)\n\n" + report + "\n"
-    _atomic_write(j, text)
-    return j
+def append_journal(target, report, transaction_id=None):
+    target = _absolute_path(target)
+    txid = transaction_id or hashlib.sha256(
+        report.encode("utf-8")).hexdigest()[:24]
+    return _append_marked_file(
+        journal_path(target),
+        "# DREAMS.md — dream journal\n\n",
+        "<!-- dream-tx:%s -->" % txid,
+        report, JOURNAL_MAX_BYTES, rotate=True)
+
+
+def _preflight_artifact(path, max_bytes):
+    """Validate an existing destination without creating anything."""
+    boundary = path.parent
+    try:
+        _read_text_retry(
+            path, max_bytes=max_bytes, boundary=boundary)
+        return
+    except FileNotFoundError:
+        pass
+    _reject_symlinked_parents(path, boundary)
+    if os.name != "nt":
+        flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                 getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(str(boundary), flags)
+        os.close(fd)
+
+
+def _transaction_id(original, new_text, report, state_after,
+                    archive="", state_before=""):
+    payload = "\0".join((
+        original, new_text, archive, report, state_before, state_after))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def _build_transaction(target, plan):
+    archive = _archive_block(
+        plan["dreamer"].actions, plan["stamp"])
+    txid = _transaction_id(
+        plan["original"], plan["new_text"], plan["report"],
+        plan["state_after"], archive=archive,
+        state_before=plan["state_raw"])
+    backup = "%s.bak-dream-%s-%s" % (
+        target.name, plan["stamp"].replace("-", "").replace(":", "").replace(
+            " ", "-"), txid[:8])
+    return {
+        "version": 1,
+        "target": target.name,
+        "tx": txid,
+        "backup": backup,
+        "original": plan["original"],
+        "new_text": plan["new_text"],
+        "archive": archive,
+        "report": plan["report"],
+        "state_before": plan["state_raw"],
+        "state_after": plan["state_after"],
+    }
+
+
+def _validate_transaction(target, tx):
+    required = {
+        "version": int, "target": str, "tx": str, "backup": str,
+        "original": str, "new_text": str, "archive": str,
+        "report": str, "state_before": str, "state_after": str,
+    }
+    if not isinstance(tx, dict):
+        raise ValueError("pending transaction is not an object")
+    for key, kind in required.items():
+        value = tx.get(key)
+        valid = type(value) is int if kind is int else isinstance(value, kind)
+        if not valid:
+            raise ValueError(
+                "pending transaction has an invalid %s" % key)
+    if tx["version"] != 1 or tx["target"] != target.name:
+        raise ValueError("pending transaction belongs to another target")
+    if not re.fullmatch(r"[0-9a-f]{24}", tx["tx"]):
+        raise ValueError("pending transaction id is invalid")
+    if Path(tx["backup"]).name != tx["backup"] or not tx["backup"].startswith(
+            target.name + ".bak-dream-") or not tx["backup"].endswith(
+                "-" + tx["tx"][:8]):
+        raise ValueError("pending backup name is invalid")
+    if len(tx["original"].encode("utf-8")) > MAX_TARGET_BYTES or \
+            len(tx["new_text"].encode("utf-8")) > MAX_TARGET_BYTES:
+        raise FileLimitError("pending transaction target is too large")
+    if len(tx["archive"].encode("utf-8")) > MAX_SIDE_BYTES or \
+            len(tx["report"].encode("utf-8")) > JOURNAL_MAX_BYTES or \
+            len(tx["state_before"].encode("utf-8")) > MAX_SIDE_BYTES or \
+            len(tx["state_after"].encode("utf-8")) > MAX_SIDE_BYTES:
+        raise FileLimitError("pending transaction side data is too large")
+    expected = _transaction_id(
+        tx["original"], tx["new_text"], tx["report"], tx["state_after"],
+        archive=tx["archive"], state_before=tx["state_before"])
+    if tx["tx"] != expected:
+        raise ValueError("pending transaction checksum does not match")
+
+
+def _ensure_backup(target, tx):
+    path = target.parent / tx["backup"]
+    existing, identity = _read_optional(
+        path, max_bytes=MAX_TARGET_BYTES, with_identity=True,
+        boundary=target.parent)
+    if identity is _EXPECTED_MISSING:
+        _atomic_write(
+            path, tx["original"], boundary=target.parent,
+            expected_identity=_EXPECTED_MISSING)
+    elif existing != tx["original"]:
+        raise StaleTargetError(
+            "backup path contains different data: %s" % path)
+    return path
+
+
+def _commit_target(target, tx):
+    current, identity = _read_text_retry(
+        target, max_bytes=MAX_TARGET_BYTES, with_identity=True,
+        boundary=target.parent)
+    if current == tx["new_text"]:
+        return
+    if current != tx["original"]:
+        raise StaleTargetError(
+            "%s changed outside dream; refusing to overwrite it" % target)
+    _atomic_write(
+        target, tx["new_text"], boundary=target.parent,
+        expected_identity=identity)
+
+
+def _commit_state(target, tx):
+    path = state_path(target)
+    current, identity = _read_optional(
+        path, max_bytes=MAX_SIDE_BYTES, with_identity=True,
+        boundary=target.parent)
+    if current == tx["state_after"]:
+        return
+    if current != tx["state_before"]:
+        raise StaleTargetError(
+            "%s changed outside dream; refusing to overwrite it" % path)
+    _atomic_write(
+        path, tx["state_after"], boundary=target.parent,
+        expected_identity=identity)
+
+
+def _recover_pending(target):
+    """Finish an interrupted apply. Every step is idempotent."""
+    path = pending_path(target)
+    raw, pending_identity = _read_optional(
+        path, max_bytes=MAX_PENDING_BYTES, with_identity=True,
+        boundary=target.parent)
+    if pending_identity is _EXPECTED_MISSING:
+        return False
+    try:
+        tx = json.loads(raw)
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise ValueError(
+            "pending transaction is corrupt: %s" % exc)
+    _validate_transaction(target, tx)
+    marker = "<!-- dream-tx:%s -->" % tx["tx"]
+    _ensure_backup(target, tx)
+    if tx["archive"]:
+        _append_marked_file(
+            archive_path(target),
+            "# dream archive — nothing is ever deleted, only moved here\n\n",
+            marker, tx["archive"], MAX_SIDE_BYTES)
+    # Removed entries are durable before the live file is consolidated.
+    _commit_target(target, tx)
+    _append_marked_file(
+        journal_path(target),
+        "# DREAMS.md — dream journal\n\n",
+        marker, tx["report"], JOURNAL_MAX_BYTES, rotate=True)
+    _commit_state(target, tx)
+    _, latest_identity = _read_text_retry(
+        path, max_bytes=MAX_PENDING_BYTES, with_identity=True,
+        boundary=target.parent)
+    if latest_identity != pending_identity:
+        raise StaleTargetError(
+            "pending transaction changed during recovery")
+    _unlink_regular(
+        path, target.parent, expected_identity=latest_identity)
+    return True
+
+
+def _build_plan(target, opts):
+    original, target_identity = _read_text_retry(
+        target, max_bytes=MAX_TARGET_BYTES, with_identity=True,
+        boundary=target.parent)
+    fmt = opts.get("format") or detect_format(original)
+    preamble, entries = parse(original, fmt)
+    if not entries:
+        return {
+            "empty": True, "original": original, "format": fmt,
+            "target_identity": target_identity,
+        }
+
+    state, state_raw, state_identity = _load_state_snapshot(target)
+    dreamer = Dreamer(entries, fmt, opts)
+    dreamer.light_sleep()
+    dreamer.deep_sleep()
+    dreamer.age_out(state, opts.get("max_age"))
+    dreamer.rem()
+    dreamer.squeeze(opts.get("budget"))
+
+    new_entries = [
+        entry.text for entry in sorted(
+            dreamer.entries, key=lambda entry: entry.pos)]
+    new_text = serialize(preamble, new_entries, fmt)
+    size_before = content_size(entries, fmt)
+    size_after = content_size(new_entries, fmt)
+    stamp = _now().strftime("%Y-%m-%d %H:%M")
+    report = ["## dream — %s — %s" % (stamp, target.name), ""]
+    report.append(
+        "- entries: %d -> %d | chars: %d -> %d%s"
+        % (len(entries), len(new_entries), size_before, size_after,
+           (" | budget: %d" % opts["budget"])
+           if opts.get("budget") else ""))
+    if dreamer.actions:
+        report.append("")
+        for action in dreamer.actions:
+            report.append(
+                "- " + action.describe().replace("\n", "\n  "))
+    else:
+        report.append(
+            "- memory is already clean: no duplicates, no supersessions.")
+    if dreamer.flags:
+        report.append("\n### flags (no action taken)")
+        for flag in dreamer.flags:
+            report.append("- " + flag.replace("\n", "\n  "))
+    if dreamer.themes:
+        report.append("\n### recurring themes")
+        report.append("- " + ", ".join(
+            "%s (x%d)" % (theme, count)
+            for theme, count in dreamer.themes))
+    report_text = "\n".join(report)
+    if len(report_text.encode("utf-8")) > JOURNAL_MAX_BYTES:
+        raise FileLimitError(
+            "dream report exceeds the %d-byte journal limit"
+            % JOURNAL_MAX_BYTES)
+    state_after = _state_text(dreamer.entries, state)
+    if len(state_after.encode("utf-8")) > MAX_SIDE_BYTES:
+        raise FileLimitError(
+            "dream state exceeds the %d-byte limit" % MAX_SIDE_BYTES)
+    return {
+        "empty": False,
+        "original": original,
+        "target_identity": target_identity,
+        "format": fmt,
+        "entries": entries,
+        "new_entries": new_entries,
+        "new_text": new_text,
+        "size_before": size_before,
+        "size_after": size_after,
+        "stamp": stamp,
+        "report": report_text,
+        "changed": new_text.strip() != original.strip(),
+        "dreamer": dreamer,
+        "state": state,
+        "state_raw": state_raw,
+        "state_identity": state_identity,
+        "state_after": state_after,
+    }
+
+
+def _show_dry_run(target, plan, quiet):
+    if not quiet:
+        print(_terminal_text(plan["report"]))
+        if plan["changed"]:
+            print("\n--- diff preview ---")
+            for line in difflib.unified_diff(
+                    plan["original"].splitlines(),
+                    plan["new_text"].splitlines(),
+                    fromfile=str(target),
+                    tofile=str(target) + " (after dream)",
+                    lineterm=""):
+                print(_terminal_text(line))
+            print("\ndry run — nothing written. add --apply to consolidate.")
+        else:
+            print("\nno changes needed.")
+    else:
+        print("%s: %d -> %d entries, %d -> %d chars (dry run)"
+              % (target.name, len(plan["entries"]),
+                 len(plan["new_entries"]), plan["size_before"],
+                 plan["size_after"]))
+
+
+def _apply_plan(target, plan, quiet):
+    for path, limit in (
+            (archive_path(target), MAX_SIDE_BYTES),
+            (journal_path(target), JOURNAL_MAX_BYTES),
+            (state_path(target), MAX_SIDE_BYTES),
+            (pending_path(target), MAX_PENDING_BYTES)):
+        _preflight_artifact(path, limit)
+
+    if plan["changed"]:
+        tx = _build_transaction(target, plan)
+        _validate_transaction(target, tx)
+        backup = target.parent / tx["backup"]
+        _preflight_artifact(backup, MAX_TARGET_BYTES)
+        pending = json.dumps(
+            tx, ensure_ascii=False, sort_keys=True)
+        if len(pending.encode("utf-8")) > MAX_PENDING_BYTES:
+            raise FileLimitError(
+                "pending transaction exceeds %d bytes"
+                % MAX_PENDING_BYTES)
+        _atomic_write(
+            pending_path(target), pending, boundary=target.parent,
+            expected_identity=_EXPECTED_MISSING)
+        _recover_pending(target)
+        print("%s consolidated: %d -> %d entries, %d -> %d chars"
+              % (target.name, len(plan["entries"]),
+                 len(plan["new_entries"]), plan["size_before"],
+                 plan["size_after"]))
+        if not quiet:
+            print("  backup:  %s" % backup.name)
+            if tx["archive"]:
+                print("  archive: %s (every removed entry, with reasons)"
+                      % archive_path(target).name)
+            print("  journal: %s" % journal_path(target).name)
+        return
+
+    txid = _transaction_id(
+        plan["original"], plan["new_text"], plan["report"],
+        plan["state_after"])
+    append_journal(target, plan["report"], transaction_id=txid)
+    _atomic_write(
+        state_path(target), plan["state_after"], boundary=target.parent,
+        expected_identity=plan["state_identity"])
+    print("%s: already clean, nothing to change." % target.name)
 
 
 # ────────────────────────────────────────────────────────────────
 # Runner
 # ────────────────────────────────────────────────────────────────
 def dream_file(target, opts):
-    target = Path(target).expanduser().resolve()
-    if not target.exists():
+    target = _absolute_path(target)
+    if not os.path.lexists(str(target)):
         print("error: %s does not exist" % target, file=sys.stderr)
         return 1
-    original = target.read_text("utf-8")
-    fmt = opts.get("format") or detect_format(original)
-    preamble, entries = parse(original, fmt)
-    if not entries:
-        print("%s: no entries found (format: %s) — nothing to do." % (target.name, fmt))
+    try:
+        if opts.get("apply"):
+            with _exclusive_file_lock(
+                    lock_path(target), target.parent):
+                _recover_pending(target)
+                plan = _build_plan(target, opts)
+                if plan["empty"]:
+                    print("%s: no entries found (format: %s) — nothing to do."
+                          % (target.name, plan["format"]))
+                    return 0
+                _apply_plan(target, plan, opts.get("quiet"))
+                return 0
+        plan = _build_plan(target, opts)
+        if plan["empty"]:
+            print("%s: no entries found (format: %s) — nothing to do."
+                  % (target.name, plan["format"]))
+            return 0
+        _show_dry_run(target, plan, opts.get("quiet"))
         return 0
-
-    d = Dreamer(entries, fmt, opts)
-    d.light_sleep()
-    d.deep_sleep()
-    state = load_state(target)
-    d.age_out(state, opts.get("max_age"))
-    d.rem()
-    d.squeeze(opts.get("budget"))
-
-    new_entries = [e.text for e in sorted(d.entries, key=lambda e: e.pos)]
-    new_text = serialize(preamble, new_entries, fmt)
-    size_before = content_size(entries, fmt)
-    size_after = content_size(new_entries, fmt)
-
-    # build the journal report
-    stamp = _now().strftime("%Y-%m-%d %H:%M")
-    rep = ["## dream — %s — %s" % (stamp, target.name), ""]
-    rep.append("- entries: %d -> %d | chars: %d -> %d%s"
-               % (len(entries), len(new_entries), size_before, size_after,
-                  (" | budget: %d" % opts["budget"]) if opts.get("budget") else ""))
-    if d.actions:
-        rep.append("")
-        for a in d.actions:
-            rep.append("- " + a.describe().replace("\n", "\n  "))
-    else:
-        rep.append("- memory is already clean: no duplicates, no supersessions.")
-    if d.flags:
-        rep.append("\n### flags (no action taken)")
-        for f in d.flags:
-            rep.append("- " + f.replace("\n", "\n  "))
-    if d.themes:
-        rep.append("\n### recurring themes")
-        rep.append("- " + ", ".join("%s (x%d)" % (t, c) for t, c in d.themes))
-    report = "\n".join(rep)
-
-    changed = new_text.strip() != original.strip()
-    quiet = opts.get("quiet")
-
-    if not opts.get("apply"):
-        if not quiet:
-            print(report)
-            if changed:
-                print("\n--- diff preview ---")
-                for line in difflib.unified_diff(
-                        original.splitlines(), new_text.splitlines(),
-                        fromfile=str(target), tofile=str(target) + " (after dream)",
-                        lineterm=""):
-                    print(line)
-                print("\ndry run — nothing written. add --apply to consolidate.")
-            else:
-                print("\nno changes needed.")
-        else:
-            print("%s: %d -> %d entries, %d -> %d chars (dry run)"
-                  % (target.name, len(entries), len(new_entries),
-                     size_before, size_after))
-        return 0
-
-    # apply: backup -> write -> archive -> journal -> state
-    if changed:
-        # Preflight the side-files BEFORE overwriting the live memory: if the
-        # archive/journal/state can't be written (symlink, unwritable dir,
-        # a directory in the way), abort now so we never leave the target
-        # consolidated with its removed entries un-archived (auditor finding:
-        # this used to half-complete and die with a raw traceback).
-        blocked = _preflight_apply_paths(target)
-        if blocked:
-            print("error: cannot safely apply — %s is not writable "
-                  "(symlink or bad path?). Nothing changed." % blocked,
-                  file=sys.stderr)
-            return 1
-        backup = target.parent / ("%s.bak-dream-%s" % (
-            target.name, _now().strftime("%Y%m%d-%H%M%S")))
-        _atomic_write(backup, original)
-        _atomic_write(target, new_text)
-        arch = append_archive(target, d.actions)
-        j = append_journal(target, report)
-        save_state(target, d.entries, state)
-        print("%s consolidated: %d -> %d entries, %d -> %d chars"
-              % (target.name, len(entries), len(new_entries),
-                 size_before, size_after))
-        if not quiet:
-            print("  backup:  %s" % backup.name)
-            if arch:
-                print("  archive: %s (every removed entry, with reasons)" % arch.name)
-            print("  journal: %s" % j.name)
-    else:
-        save_state(target, d.entries, state)
-        append_journal(target, report)
-        print("%s: already clean, nothing to change." % target.name)
-    return 0
+    except (OSError, ValueError, UnicodeError) as exc:
+        print("error: %s" % _terminal_text(exc), file=sys.stderr)
+        return 1
 
 
 def hermes_targets():
     """Locate Hermes memory files + their configured char limits."""
-    home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    home = hermes_home()
     cfg = home / "config.yaml"
     mem_limit, user_limit = 2200, 1375       # Hermes defaults
-    if cfg.exists():
+    try:
+        text = _read_text_retry(
+            cfg, max_bytes=MAX_SIDE_BYTES, boundary=home)
+    except FileNotFoundError:
+        text = ""
+    except (OSError, ValueError, UnicodeError):
+        text = ""
+    if text:
         try:
-            text = cfg.read_text("utf-8")
             m = re.search(r"memory_char_limit:\s*(\d+)", text)
             if m:
                 mem_limit = int(m.group(1))
             m = re.search(r"user_char_limit:\s*(\d+)", text)
             if m:
                 user_limit = int(m.group(1))
-        except OSError:
+        except (ValueError, OverflowError):
             pass
     out = []
     for name, limit in (("MEMORY.md", mem_limit), ("USER.md", user_limit)):
@@ -838,6 +1633,21 @@ def hermes_targets():
         if p.exists():
             out.append((p, limit))
     return out
+
+
+def hermes_home(environ=None, os_name=None, user_home=None):
+    """Return the active Hermes profile directory on every platform."""
+    environ = os.environ if environ is None else environ
+    configured = environ.get("HERMES_HOME")
+    if configured:
+        return _absolute_path(configured)
+    platform_name = os.name if os_name is None else os_name
+    if platform_name == "nt":
+        local = environ.get("LOCALAPPDATA")
+        if local:
+            return _absolute_path(Path(local) / "hermes")
+    base = Path.home() if user_home is None else Path(user_home)
+    return _absolute_path(base / ".hermes")
 
 
 def main(argv=None):
@@ -903,7 +1713,7 @@ def main(argv=None):
     if hermes:
         targets = hermes_targets()
         if not targets:
-            home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+            home = hermes_home()
             print("error: no Hermes memory found (%s)" % (home / "memories"),
                   file=sys.stderr)
             return 1

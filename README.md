@@ -36,8 +36,8 @@ curl -O https://raw.githubusercontent.com/Da7-Tech/dream/main/dream.py
 
 python3 dream.py MEMORY.md              # dry run: journal + diff, no writes
 python3 dream.py MEMORY.md --apply      # consolidate (backup + archive + journal)
-python3 dream.py --hermes --apply       # Hermes: ~/.hermes/memories/* with the
-                                        # char budgets read from config.yaml
+python3 dream.py --hermes --apply       # active Hermes profile: HERMES_HOME,
+                                        # or the platform-native default
 ```
 
 Dry run is the default. `--apply` always writes a timestamped backup, moves
@@ -85,13 +85,20 @@ language memories are handled correctly.
 ## Safety model (the whole point)
 
 1. **Dry run by default** — you always see the diff and the reasons first.
-2. **Nothing is ever destroyed** — every removed entry goes to
-   `<file>.dream-archive.md` with a timestamp and the reason.
-3. **Timestamped backup** of the original before every `--apply`.
+2. **Nothing is ever destroyed** — every removed entry reaches
+   `<file>.dream-archive.md` with a timestamp and reason before the live
+   memory is replaced.
+3. **Recoverable transaction** — a timestamped backup and private pending
+   record make an interrupted apply resume idempotently on the next run.
 4. **Uncertain cases are flagged, not acted on** — low-overlap conflicts go
    to the journal as flags for you (or your agent) to resolve.
-5. **Atomic, symlink-refusing writes**; idempotent (a second dream on a
-   clean memory changes nothing — this is a unit test).
+5. **One portable lock covers fresh read → plan → commit**, including the
+   shared journal, so concurrent processes cannot lose each other's work.
+6. **Private regular files only** — symlinks, symlinked parents, hard links,
+   FIFOs, devices, sockets, and directories are refused.
+7. **Atomic durable rewrites with stale-edit detection** — short writes,
+   power-loss durability, permission preservation, Windows sharing races,
+   and outside edits are covered by regression tests.
 
 ## Options
 
@@ -108,7 +115,14 @@ language memories are handled correctly.
 
 ## Measured
 
-- 53 unit tests, stdlib `unittest`: `python3 -m unittest discover -s tests`
+- 72 unit tests, stdlib `unittest`: `python3 -m unittest discover -s tests`
+- Adversarial persistence tests inject process interruption before and after
+  the live rewrite, run real concurrent processes against one target and two
+  targets sharing a journal, and verify stale external edits, links, FIFOs,
+  short writes, permissions, and resource ceilings.
+- A seeded stdlib fuzzer runs 240 hostile mixed-format/Unicode/state cases in
+  CI and asserts clean refusal, no rejected-write mutation, and a readable
+  follow-up state.
 - **90-day soak in CI** (`bench/soak.py` — real code, injected clock, daily
   churn + nightly dream): newest statement of every evolving subject won,
   nothing lost (file ∪ archive), byte-identical across full reruns. A
@@ -138,8 +152,11 @@ cross-agent export — that's the sister project:
   "A calls B" and "B calls A" are treated as distinct (they fall through to
   the conflict flag), not silently deduped.
 - Theme detection is term-frequency based, a report not an oracle.
-- Pairwise comparison is O(n²): instant for agent-memory files (a 13-entry
-  real memory: ~2 ms), slow for huge files (an adversarial 18,000-entry,
-  1 MB file took ~3 minutes). It is a memory-file tool, not a corpus tool.
+- Pairwise comparison is inherently O(n²), so `dream` refuses corpus-sized
+  work instead of hanging: 10 MB input, 10,000 entries, and 200,000
+  pair/candidate comparisons are hard ceilings. It is a memory-file tool,
+  not a corpus tool.
+- Archive and state files are capped at 10 MB and the rolling journal at
+  64 KB. A limit failure is explicit and happens before any semantic write.
 
 Arabic README: [README.ar.md](README.ar.md) · License: MIT

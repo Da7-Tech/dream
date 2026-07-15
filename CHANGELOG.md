@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.4.0 — 2026-07-15
+
+Persistence, concurrency, filesystem, resource, and Hermes-profile hardening
+ported from the `mind` 6.2.8–6.2.10 dream/consolidation work where it applies
+to this standalone file consolidator:
+
+- **One portable directory lock now covers fresh read, planning, and commit.**
+  Concurrent dreams on the same target serialize, and different Hermes
+  targets in the same directory cannot race and lose each other's shared
+  `DREAMS.md` records. The lock is bounded to 30 seconds and uses `flock` on
+  POSIX and `msvcrt.locking` on Windows.
+- **Interrupted applies recover automatically.** A private pending
+  transaction is durably written before the first semantic change. The
+  timestamped backup and every removed entry reach the archive before the
+  live memory is replaced; every step is idempotently replayed on the next
+  run, then the pending record is removed. Tested with injected failures
+  immediately before the target write and immediately after it.
+- **Stale decisions cannot clobber external edits.** Reads capture file
+  identity, atomic rewrites compare it again immediately before replace, and
+  an outside writer wins cleanly instead of being overwritten.
+- **Filesystem safety is now real, not only documented.** Target, state,
+  archive, journal, pending record, backup, and lock paths require regular
+  single-link files. Symlinks, symlinked parents, hard links, FIFOs, devices,
+  sockets, and directories are refused. POSIX writes traverse opened
+  directory handles; existing permissions are preserved.
+- **Atomic writes are fully durable.** Unpredictable exclusive temporary
+  files, complete short-write handling, file `fsync`, atomic replace, and
+  destination-directory `fsync` are used on POSIX. Windows replacement and
+  read sharing violations are retried.
+- **Resource use is bounded.** Memory files are limited to 10 MB and 10,000
+  entries; side files are bounded; and quadratic consolidation work stops at
+  200,000 pair/candidate comparisons. A limit failure happens before any
+  semantic write.
+- **Terminal output is control-safe.** Memory contents are preserved exactly
+  in files and archives, while terminal and bidirectional control codes are
+  stripped from displayed reports and diffs.
+- **Hermes profile resolution is cross-platform.** `HERMES_HOME` always wins;
+  the defaults are `~/.hermes` on POSIX and `%LOCALAPPDATA%/hermes` on
+  Windows. The bundled skill now installs and schedules against that same
+  active profile and supplies separate POSIX and PowerShell instructions.
+- Expanded from 53 to 72 stdlib tests, including real multi-process
+  same-target and shared-journal races, crash recovery, stale writes,
+  malicious filesystem objects, short writes, resource ceilings, permission
+  preservation, and platform-specific Hermes homes. A new seeded fuzzer runs
+  240 hostile cases in CI. The 90-day soak and budget-stress run remain green.
+
 ## 1.3.0 — 2026-07-05
 
 Tokenizer/stemmer parity with `mind`. `dream` and `mind` share a
